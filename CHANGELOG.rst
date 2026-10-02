@@ -6,6 +6,13 @@ Changelog
 
 Features:
 
+* Add ``Parser.iter_ndjson`` for parsing newline-delimited JSON (NDJSON)
+  request bodies lazily, validating one record per line against a schema.
+  Supports ``on_error="raise"`` (fail-fast) and ``on_error="yield"``
+  (per-record ``NDJSONResult``) error strategies, per-line size limits, and
+  releases the request stream when iteration ends or fails.
+* Add ``webargs.ndjson`` module with ``NDJSONError`` and ``NDJSONResult``.
+
 * *Backwards-incompatible*: Remove ``__version__``, ``__parsed_version__``, and
   ``__version_info__`` constants from ``__init__.py`` file. Users should use
   ``importlib.metadata`` instead (:pr:`1024`).

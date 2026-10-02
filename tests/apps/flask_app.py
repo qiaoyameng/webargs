@@ -50,6 +50,17 @@ def echo_json_or_form():
     return J(parser.parse(hello_args, location="json_or_form"))
 
 
+@app.route("/echo_ndjson", methods=["POST"])
+def echo_ndjson():
+    results = []
+    for result in parser.iter_ndjson(HelloSchema, request, on_error="yield"):
+        if result.ok:
+            results.append({"line": result.line, "data": result.data})
+        else:
+            results.append({"line": result.line, "error": result.error.messages})
+    return J(results)
+
+
 @app.route("/echo_use_args", methods=["GET"])
 @use_args(hello_args, location="query")
 def echo_use_args(args):

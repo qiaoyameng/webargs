@@ -76,6 +76,10 @@ class FlaskParser(core.Parser[flask.Request]):
 
         return core.parse_json(req.get_data(cache=True))
 
+    def get_request_stream(self, req: flask.Request) -> typing.IO[bytes]:
+        """Return the WSGI input stream, for use with `iter_ndjson`."""
+        return req.stream
+
     def _handle_invalid_json_error(
         self,
         error: json.JSONDecodeError | UnicodeDecodeError,

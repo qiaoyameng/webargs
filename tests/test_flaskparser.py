@@ -26,6 +26,17 @@ class TestFlaskParser(CommonTestCase):
         assert res.status_code == 422
         assert res.json == {"view_args": {"view_arg": ["Not a valid integer."]}}
 
+    def test_iter_ndjson(self, testapp):
+        body = '{"name": "alice"}\n{"name": 42}\n{"name": "bob"}\n'
+        res = testapp.post(
+            "/echo_ndjson", body, content_type="application/x-ndjson"
+        )
+        assert res.json == [
+            {"line": 1, "data": {"name": "alice"}},
+            {"line": 2, "error": {"name": ["Not a valid string."]}},
+            {"line": 3, "data": {"name": "bob"}},
+        ]
+
     def test_use_args_with_view_args_parsing(self, testapp):
         res = testapp.get("/echo_view_arg_use_args/42")
         assert res.json == {"view_arg": 42}

@@ -10,6 +10,13 @@ webargs.core
     :inherited-members:
 
 
+webargs.ndjson
+--------------
+
+.. automodule:: webargs.ndjson
+    :members:
+
+
 webargs.fields
 --------------
 

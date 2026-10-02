@@ -6,5 +6,13 @@ from marshmallow.utils import missing
 
 from webargs import fields
 from webargs.core import ValidationError
+from webargs.ndjson import NDJSONError, NDJSONResult
 
-__all__ = ("ValidationError", "fields", "missing", "validate")
+__all__ = (
+    "NDJSONError",
+    "NDJSONResult",
+    "ValidationError",
+    "fields",
+    "missing",
+    "validate",
+)

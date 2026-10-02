@@ -12,6 +12,13 @@ from marshmallow import ValidationError
 from marshmallow.utils import missing
 
 from webargs.multidictproxy import MultiDictProxy
+from webargs.ndjson import (
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_MAX_LINE_LENGTH,
+    NDJSONError,
+    NDJSONResult,
+    iter_lines,
+)
 
 if typing.TYPE_CHECKING:
     from webargs._types import (
@@ -28,6 +35,8 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ValidationError",
+    "NDJSONError",
+    "NDJSONResult",
     "Parser",
     "missing",
     "parse_json",
@@ -489,6 +498,147 @@ class Parser(typing.Generic[Request]):
                 "_on_validation_error hook did not raise an exception"
             ) from error
         return data
+
+    def get_request_stream(self, req: Request) -> typing.IO[bytes] | None:
+        """Optional override. Return the request body as a binary stream.
+
+        Used by `iter_ndjson` when no explicit ``stream`` is passed. The
+        default implementation returns `None`, meaning a stream must be
+        passed to `iter_ndjson` directly.
+        """
+        return None
+
+    def iter_ndjson(
+        self,
+        argmap: ArgMap[Request],
+        req: Request | None = None,
+        *,
+        stream: typing.IO[bytes] | None = None,
+        on_error: str = "raise",
+        max_line_length: int = DEFAULT_MAX_LINE_LENGTH,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        unknown: str | None = _UNKNOWN_DEFAULT_PARAM,
+        validate: ValidateArg = None,
+    ) -> typing.Iterator[typing.Any | NDJSONResult]:
+        """Parse a newline-delimited JSON (NDJSON) request body lazily.
+
+        Each line of the body is parsed as a standalone JSON document and
+        validated against the given schema, yielding one result per line.
+        The body is consumed incrementally, so memory usage does not grow
+        with the number of records. Creating the returned iterator does not
+        read any of the body; when iteration ends early or raises, the
+        stream is closed to release the underlying read state.
+
+        :param argmap: Either a `marshmallow.Schema`, a `dict`
+            of argname -> `marshmallow.fields.Field` pairs, or a callable
+            which accepts a request and returns a `marshmallow.Schema`.
+            The schema is reused for every line.
+        :param req: The request object to parse.
+        :param stream: A binary stream to read the body from. Defaults to
+            the stream returned by `get_request_stream` for the request.
+        :param str on_error: Error handling strategy. With ``"raise"`` (the
+            default), validated records are yielded and the first error
+            raises an `NDJSONError`, stopping iteration; records already
+            yielded are unaffected. With ``"yield"``, an `NDJSONResult` is
+            yielded for every line, carrying either the validated data or
+            the error.
+        :param int max_line_length: Maximum length of a single line, in
+            characters. Longer lines produce an error and are discarded.
+        :param int chunk_size: Number of bytes requested from the stream
+            per read.
+        :param str unknown: A value to pass for ``unknown`` when calling the
+            schema's ``load`` method, as in `parse`.
+        :param callable validate: Validation function or list of validation
+            functions applied to each record, as in `parse`.
+
+        :return: An iterator of validated records (`on_error="raise"`) or
+            of `NDJSONResult` (`on_error="yield"`).
+        """
+        if on_error not in ("raise", "yield"):
+            raise ValueError(f"on_error must be 'raise' or 'yield', got {on_error!r}")
+        _, req, _, validators, schema = self._prepare_for_parse(
+            argmap, req, "json", unknown, validate
+        )
+        if stream is None:
+            stream = self.get_request_stream(req)
+        if stream is None:
+            raise ValueError(
+                "No request body stream is available. Pass a stream or "
+                "implement get_request_stream() on the parser."
+            )
+        # precedence order: explicit, instance setting, default for json
+        resolved_unknown = (
+            unknown
+            if unknown != _UNKNOWN_DEFAULT_PARAM
+            else (
+                self.unknown
+                if self.unknown != _UNKNOWN_DEFAULT_PARAM
+                else self.DEFAULT_UNKNOWN_BY_LOCATION.get("json")
+            )
+        )
+        return self._iter_ndjson_records(
+            schema,
+            req,
+            stream,
+            on_error=on_error,
+            max_line_length=max_line_length,
+            chunk_size=chunk_size,
+            unknown=resolved_unknown,
+            validators=validators,
+        )
+
+    def _iter_ndjson_records(
+        self,
+        schema: ma.Schema,
+        req: Request,
+        stream: typing.IO[bytes],
+        *,
+        on_error: str,
+        max_line_length: int,
+        chunk_size: int,
+        unknown: str | None,
+        validators: CallableList,
+    ) -> typing.Iterator[typing.Any | NDJSONResult]:
+        load_kwargs: dict[str, typing.Any] = {"unknown": unknown} if unknown else {}
+        try:
+            for line_number, text, line_error in iter_lines(
+                stream, max_line_length=max_line_length, chunk_size=chunk_size
+            ):
+                data = None
+                error = line_error
+                if error is None:
+                    assert text is not None
+                    try:
+                        record = parse_json(text)
+                        record = self.pre_load(
+                            record, schema=schema, req=req, location="json"
+                        )
+                        data = schema.load(record, **load_kwargs)
+                        self._validate_arguments(data, validators)
+                    except ValidationError as exc:
+                        error = NDJSONError(
+                            exc.messages,
+                            line=line_number,
+                            field_name=exc.field_name,
+                            data=exc.data,
+                            valid_data=exc.valid_data,
+                        )
+                    except json.JSONDecodeError as exc:
+                        error = NDJSONError(
+                            f"Invalid JSON: {exc.msg}", line=line_number
+                        )
+                if on_error == "raise":
+                    if error is not None:
+                        raise error
+                    yield data
+                else:
+                    yield NDJSONResult(line=line_number, data=data, error=error)
+        finally:
+            # release the read state when iteration finishes, is closed
+            # early, or the stream raises (e.g. on client disconnect)
+            close = getattr(stream, "close", None)
+            if close is not None:
+                close()
 
     def get_default_request(self) -> Request | None:
         """Optional override. Provides a hook for frameworks that use thread-local
