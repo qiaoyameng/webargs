@@ -28,9 +28,11 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ValidationError",
+    "DuplicateParameterError",
     "Parser",
     "missing",
     "parse_json",
+    "parse_json_with_duplicates",
 ]
 
 
@@ -54,6 +56,42 @@ ErrorHandlerT = typing.TypeVar("ErrorHandlerT", bound="ErrorHandler")
 _UNKNOWN_DEFAULT_PARAM = "_default"
 
 DEFAULT_VALIDATION_STATUS: int = 422
+
+#: valid values for the ``duplicate_policy`` parser option
+DUPLICATE_POLICIES: tuple[str, ...] = ("reject", "first", "last")
+
+#: message used when a strict duplicate policy cannot be enforced because the
+#: framework only provides already-collapsed request data
+DUPLICATE_CHECK_UNAVAILABLE_MESSAGE: str = (
+    "Duplicate parameter policy 'reject' cannot be enforced: the framework "
+    "did not provide access to the raw request data, so duplicate parameters "
+    "cannot be detected."
+)
+
+
+class DuplicateParameterError(ValidationError):
+    """Raised when ``duplicate_policy="reject"`` is in effect and repeated
+    scalar parameters are found in the request.
+
+    Carries the ``location`` in which the duplicates were found, the
+    ``field_path`` (a tuple of keys, nested for JSON bodies) of the first
+    offending parameter, and the ``occurrence`` index (1-based) at which the
+    first repetition appeared. Values are intentionally not included.
+    """
+
+    def __init__(
+        self,
+        messages: typing.Any,
+        *,
+        location: str,
+        field_path: tuple,
+        occurrence: int,
+        **kwargs: typing.Any,
+    ) -> None:
+        super().__init__(messages, **kwargs)
+        self.location = location
+        self.field_path = tuple(field_path)
+        self.occurrence = occurrence
 
 
 def _record_arg_name(f: typing.Callable[..., typing.Any], argname: str | None) -> None:
@@ -116,6 +154,83 @@ def parse_json(s: typing.AnyStr, *, encoding: str = "utf-8") -> typing.Any:
     return json.loads(decoded)
 
 
+class _ObjectPairs(list):
+    """Marker class for JSON objects captured as ordered key-value pairs."""
+
+
+def _collapse_pairs(
+    node: typing.Any,
+    path: tuple,
+    duplicates: list,
+    keep: str,
+) -> typing.Any:
+    """Collapse a pair-captured JSON tree into plain dicts/lists.
+
+    Records every repeated object key in ``duplicates`` as
+    ``(full_path, occurrence)`` entries, where ``full_path`` includes the
+    repeated key itself and ``occurrence`` is the 1-based index of the
+    repetition (i.e. 2 for the first duplicate). ``keep`` selects whether the
+    "first" or "last" occurrence of a repeated key wins.
+    """
+    if isinstance(node, _ObjectPairs):
+        result: dict = {}
+        counts: dict = {}
+        for key, value in node:
+            counts[key] = counts.get(key, 0) + 1
+            if counts[key] > 1:
+                duplicates.append((path + (key,), counts[key]))
+                if keep == "first":
+                    continue
+            result[key] = _collapse_pairs(value, path + (key,), duplicates, keep)
+        return result
+    if isinstance(node, list):
+        return [
+            _collapse_pairs(item, path + (index,), duplicates, keep)
+            for index, item in enumerate(node)
+        ]
+    return node
+
+
+def parse_json_with_duplicates(
+    s: typing.AnyStr, *, encoding: str = "utf-8", keep: str = "last"
+) -> tuple[typing.Any, list]:
+    """Parse JSON like `parse_json`, but detect duplicate object keys at any
+    depth (including inside nested objects and arrays) before they are
+    collapsed.
+
+    Returns a ``(data, duplicates)`` tuple. ``data`` is the parsed document
+    with duplicate keys collapsed according to ``keep`` ("first" or "last").
+    ``duplicates`` is a list of ``(path, occurrence)`` tuples, where ``path``
+    is a tuple of keys/indices locating the repeated key. Keys which are
+    distinct in the raw document but equivalent after JSON unescaping are
+    treated as duplicates.
+    """
+    if keep not in ("first", "last"):
+        raise ValueError(f"keep must be 'first' or 'last', got {keep!r}")
+    if isinstance(s, str):
+        decoded = s
+    else:
+        try:
+            decoded = s.decode(encoding)
+        except UnicodeDecodeError as exc:
+            raise json.JSONDecodeError(
+                f"Bytes decoding error : {exc.reason}",
+                doc=str(exc.object),
+                pos=exc.start,
+            ) from exc
+    raw = json.loads(decoded, object_pairs_hook=_ObjectPairs)
+    duplicates: list = []
+    data = _collapse_pairs(raw, (), duplicates, keep)
+    return data, duplicates
+
+
+def _add_nested_message(messages: dict, path: tuple, message: str) -> None:
+    node = messages
+    for part in path[:-1]:
+        node = node.setdefault(part, {})
+    node.setdefault(path[-1], []).append(message)
+
+
 def _ensure_list_of_callables(obj: typing.Any) -> CallableList:
     if obj:
         if isinstance(obj, (list, tuple)):
@@ -143,6 +258,9 @@ class Parser(typing.Generic[Request]):
         locations and ``marshmallow.RAISE`` for request bodies. Pass ``None`` to use the
         schema's setting instead.
     :param callable error_handler: Custom error handler function.
+    :param str duplicate_policy: How to handle repeated scalar parameters,
+        one of ``"reject"``, ``"first"``, or ``"last"``. Defaults to ``None``,
+        which preserves the framework's native (already-collapsed) behavior.
     """
 
     #: Default location to check for data
@@ -167,6 +285,18 @@ class Parser(typing.Generic[Request]):
     DEFAULT_VALIDATION_MESSAGE: str = "Invalid value."
     #: field types which should always be treated as if they set `is_multiple=True`
     KNOWN_MULTI_FIELDS: list[type] = [ma.fields.List, ma.fields.Tuple]
+    #: valid values for the ``duplicate_policy`` option
+    DUPLICATE_POLICIES: tuple[str, ...] = DUPLICATE_POLICIES
+    #: locations for which duplicate-parameter policies are enforced
+    DUPLICATE_POLICY_LOCATIONS: tuple[str, ...] = (
+        "json",
+        "json_or_form",
+        "query",
+        "querystring",
+        "form",
+    )
+    #: message used when a strict duplicate policy cannot be enforced
+    DUPLICATE_CHECK_UNAVAILABLE_MESSAGE: str = DUPLICATE_CHECK_UNAVAILABLE_MESSAGE
     #: set use_args to use a positional argument (rather than a keyword argument)
     #  defaults to True, but will become False in a future major version
     USE_ARGS_POSITIONAL: bool = True
@@ -190,11 +320,27 @@ class Parser(typing.Generic[Request]):
         unknown: str | None = _UNKNOWN_DEFAULT_PARAM,
         error_handler: ErrorHandler | None = None,
         schema_class: type[ma.Schema] | None = None,
+        duplicate_policy: str | None = None,
     ) -> None:
         self.location = location or self.DEFAULT_LOCATION
         self.error_callback: ErrorHandler | None = _callable_or_raise(error_handler)
         self.schema_class = schema_class or self.DEFAULT_SCHEMA_CLASS
         self.unknown = unknown
+        self.duplicate_policy = self._validate_duplicate_policy(duplicate_policy)
+
+    def _validate_duplicate_policy(self, policy: str | None) -> str | None:
+        if policy is not None and policy not in self.DUPLICATE_POLICIES:
+            raise ValueError(
+                f"Invalid duplicate_policy: {policy!r}. "
+                f"Must be one of {self.DUPLICATE_POLICIES} or None."
+            )
+        return policy
+
+    def _resolve_duplicate_policy(self, duplicate_policy: str | None) -> str | None:
+        # precedence order: explicit argument, then instance setting
+        if duplicate_policy is not None:
+            return self._validate_duplicate_policy(duplicate_policy)
+        return self.duplicate_policy
 
     def _makeproxy(
         self,
@@ -363,6 +509,7 @@ class Parser(typing.Generic[Request]):
         location: str,
         unknown: str | None,
         validators: CallableList,
+        duplicate_policy: str | None = None,
     ) -> typing.Any:
         # after the data has been fetched from a registered location,
         # this is how it is processed
@@ -373,6 +520,18 @@ class Parser(typing.Generic[Request]):
         # (e.g. optional JSON body) work smoothly
         if location_data is missing:
             location_data = {}
+
+        # enforce the duplicate-parameter policy on the raw location data
+        # before unknown-handling, defaults, or field deserialization can
+        # mask any conflicts
+        if duplicate_policy is not None and location_data:
+            location_data = self._apply_duplicate_policy(
+                location_data,
+                schema=schema,
+                req=req,
+                location=location,
+                policy=duplicate_policy,
+            )
 
         # precedence order: explicit, instance setting, default per location
         unknown = (
@@ -392,6 +551,113 @@ class Parser(typing.Generic[Request]):
         self._validate_arguments(data, validators)
         return data
 
+    def _apply_duplicate_policy(
+        self,
+        location_data: typing.Any,
+        *,
+        schema: ma.Schema,
+        req: Request,
+        location: str,
+        policy: str,
+    ) -> typing.Any:
+        """Apply the duplicate-parameter policy to raw location data.
+
+        Runs before ``pre_load`` and ``schema.load`` so that `data_key`
+        mappings, default values, and ``unknown`` handling cannot mask
+        repeated parameters.
+        """
+        if location not in self.DUPLICATE_POLICY_LOCATIONS:
+            return location_data
+        if isinstance(location_data, MultiDictProxy):
+            return self._apply_multidict_duplicate_policy(
+                location_data, location=location, policy=policy
+            )
+        if location in ("json", "json_or_form"):
+            return self._apply_json_duplicate_policy(
+                location_data, req=req, location=location, policy=policy
+            )
+        # a non-multidict mapping for a multi-value-capable location carries
+        # no occurrence information
+        if policy == "reject":
+            raise ValidationError(
+                {"_schema": [self.DUPLICATE_CHECK_UNAVAILABLE_MESSAGE]}
+            )
+        return location_data
+
+    def _apply_multidict_duplicate_policy(
+        self, proxy: MultiDictProxy, *, location: str, policy: str
+    ) -> typing.Any:
+        multidict = proxy.data
+        if hasattr(multidict, "lists"):
+            items = [(key, list(values)) for key, values in multidict.lists()]
+        elif hasattr(multidict, "getlist"):
+            items = [(key, list(multidict.getlist(key))) for key in multidict]
+        elif hasattr(multidict, "getall"):
+            items = [(key, list(multidict.getall(key))) for key in multidict]
+        elif policy == "reject":
+            raise ValidationError(
+                {"_schema": [self.DUPLICATE_CHECK_UNAVAILABLE_MESSAGE]}
+            )
+        else:
+            return proxy
+        multiple_keys = proxy.multiple_keys
+        duplicates: dict[str, int] = {}
+        collapsed: dict[str, typing.Any] = {}
+        for key, values in items:
+            if key in multiple_keys:
+                # list-like fields collect every occurrence, as declared
+                collapsed[key] = values
+                continue
+            if len(values) > 1:
+                duplicates[key] = len(values)
+            collapsed[key] = values[0] if policy == "first" else values[-1]
+        if duplicates and policy == "reject":
+            messages: dict[str, list] = {}
+            for key, count in duplicates.items():
+                messages[key] = [
+                    f"Duplicate parameter at occurrence {occurrence}."
+                    for occurrence in range(2, count + 1)
+                ]
+            first_key = next(iter(duplicates))
+            raise DuplicateParameterError(
+                messages,
+                location=location,
+                field_path=(first_key,),
+                occurrence=2,
+            )
+        if policy in ("first", "last"):
+            return collapsed
+        return proxy
+
+    def _apply_json_duplicate_policy(
+        self, location_data: typing.Any, *, req: Request, location: str, policy: str
+    ) -> typing.Any:
+        raw = self._raw_load_json_text(req)
+        if raw is missing or raw == "" or raw == b"":
+            # the framework only provided an already-collapsed value, so
+            # duplicate keys cannot be detected reliably
+            if policy == "reject":
+                raise ValidationError(
+                    {"_schema": [self.DUPLICATE_CHECK_UNAVAILABLE_MESSAGE]}
+                )
+            return location_data
+        keep = "first" if policy == "first" else "last"
+        data, duplicates = parse_json_with_duplicates(raw, keep=keep)
+        if duplicates and policy == "reject":
+            messages: dict = {}
+            for path, occurrence in duplicates:
+                _add_nested_message(
+                    messages, path, f"Duplicate parameter at occurrence {occurrence}."
+                )
+            first_path, first_occurrence = duplicates[0]
+            raise DuplicateParameterError(
+                messages,
+                location=location,
+                field_path=first_path,
+                occurrence=first_occurrence,
+            )
+        return data
+
     def parse(
         self,
         argmap: ArgMap[Request],
@@ -400,6 +666,7 @@ class Parser(typing.Generic[Request]):
         location: str | None = None,
         unknown: str | None = _UNKNOWN_DEFAULT_PARAM,
         validate: ValidateArg = None,
+        duplicate_policy: str | None = None,
         error_status_code: int | None = None,
         error_headers: typing.Mapping[str, str] | None = None,
     ) -> typing.Any:
@@ -420,6 +687,10 @@ class Parser(typing.Generic[Request]):
         :param callable validate: Validation function or list of validation functions
             that receives the dictionary of parsed arguments. Validator either returns a
             boolean or raises a :exc:`ValidationError`.
+        :param str duplicate_policy: How to handle repeated scalar parameters,
+            one of ``"reject"``, ``"first"``, or ``"last"``. Overrides the
+            parser's ``duplicate_policy``. ``None`` defers to the parser
+            setting, which itself defaults to preserving existing behavior.
         :param int error_status_code: Status code passed to error handler functions when
             a `ValidationError` is raised.
         :param dict error_headers: Headers passed to error handler functions when a
@@ -430,12 +701,19 @@ class Parser(typing.Generic[Request]):
         data, req, location, validators, schema = self._prepare_for_parse(
             argmap, req, location, unknown, validate
         )
+        duplicate_policy = self._resolve_duplicate_policy(duplicate_policy)
         try:
             location_data = self._load_location_data(
                 schema=schema, req=req, location=location
             )
             data = self._process_location_data(
-                location_data, schema, req, location, unknown, validators
+                location_data,
+                schema,
+                req,
+                location,
+                unknown,
+                validators,
+                duplicate_policy,
             )
         except ma.exceptions.ValidationError as error:
             self._on_validation_error(
@@ -459,6 +737,7 @@ class Parser(typing.Generic[Request]):
         location: str | None = None,
         unknown: str | None = _UNKNOWN_DEFAULT_PARAM,
         validate: ValidateArg = None,
+        duplicate_policy: str | None = None,
         error_status_code: int | None = None,
         error_headers: typing.Mapping[str, str] | None = None,
     ) -> typing.Any:
@@ -469,12 +748,19 @@ class Parser(typing.Generic[Request]):
         data, req, location, validators, schema = self._prepare_for_parse(
             argmap, req, location, unknown, validate
         )
+        duplicate_policy = self._resolve_duplicate_policy(duplicate_policy)
         try:
             location_data = await self._async_load_location_data(
                 schema=schema, req=req, location=location
             )
             data = self._process_location_data(
-                location_data, schema, req, location, unknown, validators
+                location_data,
+                schema,
+                req,
+                location,
+                unknown,
+                validators,
+                duplicate_policy,
             )
         except ma.exceptions.ValidationError as error:
             await self._async_on_validation_error(
@@ -546,6 +832,7 @@ class Parser(typing.Generic[Request]):
         as_kwargs: bool = False,
         arg_name: str | None = None,
         validate: ValidateArg = None,
+        duplicate_policy: str | None = None,
         error_status_code: int | None = None,
         error_headers: typing.Mapping[str, str] | None = None,
     ) -> typing.Callable[..., typing.Callable]:
@@ -570,6 +857,8 @@ class Parser(typing.Generic[Request]):
         :param callable validate: Validation function that receives the dictionary
             of parsed arguments. If the function returns ``False``, the parser
             will raise a :exc:`ValidationError`.
+        :param str duplicate_policy: How to handle repeated scalar parameters.
+            See :meth:`parse` for details.
         :param int error_status_code: Status code passed to error handler functions when
             a `ValidationError` is raised.
         :param dict error_headers: Headers passed to error handler functions when a
@@ -620,6 +909,7 @@ class Parser(typing.Generic[Request]):
                         location=location,
                         unknown=unknown,
                         validate=validate,
+                        duplicate_policy=duplicate_policy,
                         error_status_code=error_status_code,
                         error_headers=error_headers,
                     )
@@ -643,6 +933,7 @@ class Parser(typing.Generic[Request]):
                         location=location,
                         unknown=unknown,
                         validate=validate,
+                        duplicate_policy=duplicate_policy,
                         error_status_code=error_status_code,
                         error_headers=error_headers,
                     )
@@ -665,6 +956,7 @@ class Parser(typing.Generic[Request]):
         location: str | None = None,
         unknown: str | None = _UNKNOWN_DEFAULT_PARAM,
         validate: ValidateArg = None,
+        duplicate_policy: str | None = None,
         error_status_code: int | None = None,
         error_headers: typing.Mapping[str, str] | None = None,
     ) -> typing.Callable[..., typing.Callable]:
@@ -689,6 +981,7 @@ class Parser(typing.Generic[Request]):
             location=location,
             unknown=unknown,
             validate=validate,
+            duplicate_policy=duplicate_policy,
             error_status_code=error_status_code,
             error_headers=error_headers,
         )
@@ -836,6 +1129,16 @@ class Parser(typing.Generic[Request]):
         However, by implementing a "mostly concrete" version of load_json with
         this as a hook for getting data, we consolidate the logic for handling
         those JSONDecodeErrors.
+        """
+        return missing
+
+    def _raw_load_json_text(self, req: Request) -> typing.Any:
+        """Internal hook for accessing the raw JSON request body.
+
+        Return the raw request body (``str`` or ``bytes``) when the framework
+        provides access to it, or `missing` when only an already-parsed
+        (collapsed) value is available. Used to enforce duplicate-parameter
+        policies on JSON bodies before keys are collapsed by ``json.loads``.
         """
         return missing
 

@@ -799,6 +799,57 @@ provide an argument name. For example,
     def myview(*, rectangle, query_args): ...
 
 
+.. _advanced_duplicate_policy:
+
+Duplicate Parameter Policy
+--------------------------
+
+Frameworks disagree on how repeated parameters are interpreted: a gateway may
+take the first value of ``?a=1&a=2`` while the application takes the last, so
+the same request is read two different ways. webargs can apply an explicit
+cardinality policy to repeated scalar parameters before any field
+deserialization happens, using the ``duplicate_policy`` option.
+
+.. code-block:: python
+
+    from webargs.flaskparser import FlaskParser
+
+    parser = FlaskParser(duplicate_policy="reject")
+
+The supported policies are:
+
+- ``"reject"``: raise a `webargs.DuplicateParameterError` (a
+  `marshmallow.ValidationError` subclass) when a scalar parameter occurs more
+  than once, even if the repeated values are identical.
+- ``"first"``: keep the first occurrence of a repeated scalar parameter.
+- ``"last"``: keep the last occurrence of a repeated scalar parameter.
+- `None` (default): preserve the framework's native parsing behavior.
+
+The policy applies to the ``query``, ``querystring``, ``form``, ``json``, and
+``json_or_form`` locations and can also be set per-call via
+:meth:`Parser.parse <webargs.core.Parser.parse>`, ``use_args``, and
+``use_kwargs``.
+
+List-like fields (e.g. `fields.List`) are unaffected: they still collect every
+occurrence, as declared. The check runs on the raw location data before
+``unknown`` handling, ``load_default`` values, or ``data_key`` mapping can
+mask a conflict.
+
+For JSON bodies, duplicate object keys are detected in the raw payload --
+including inside nested objects and arrays, and including keys which are only
+equivalent after JSON unescaping -- before ``json.loads`` would collapse them.
+If a framework only exposes an already-parsed (collapsed) body and the raw
+payload is unavailable, the ``"reject"`` policy raises an error stating that
+the check cannot be guaranteed rather than silently passing.
+
+Errors report the location, the field path, and the occurrence index of each
+repetition; parameter values are never echoed back.
+
+.. code-block:: python
+
+    # GET /?a=1&a=2  with duplicate_policy="reject"
+    # -> 422 {"query": {"a": ["Duplicate parameter at occurrence 2."]}}
+
 Next Steps
 ----------
 

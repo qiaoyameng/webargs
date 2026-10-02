@@ -71,10 +71,19 @@ class FlaskParser(core.Parser[flask.Request]):
 
         Checks the input mimetype and may return 'missing' if the mimetype is
         non-json, even if the request body is parseable as json."""
+        raw = self._raw_load_json_text(req)
+        if raw is core.missing:
+            return core.missing
+        return core.parse_json(raw)
+
+    def _raw_load_json_text(self, req: flask.Request) -> typing.Any:
+        """Return the raw request body for JSON requests.
+
+        Enables duplicate-parameter policies to inspect the original payload
+        before ``json.loads`` collapses repeated object keys."""
         if not is_json_request(req):
             return core.missing
-
-        return core.parse_json(req.get_data(cache=True))
+        return req.get_data(cache=True)
 
     def _handle_invalid_json_error(
         self,

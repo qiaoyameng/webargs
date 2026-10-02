@@ -5,6 +5,12 @@ from marshmallow import validate
 from marshmallow.utils import missing
 
 from webargs import fields
-from webargs.core import ValidationError
+from webargs.core import DuplicateParameterError, ValidationError
 
-__all__ = ("ValidationError", "fields", "missing", "validate")
+__all__ = (
+    "DuplicateParameterError",
+    "ValidationError",
+    "fields",
+    "missing",
+    "validate",
+)
