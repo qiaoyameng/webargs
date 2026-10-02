@@ -101,7 +101,9 @@ class AIOHTTPParser(core.Parser[web.Request]):
         if not (req.body_exists and is_json_request(req)):
             return core.missing
         try:
-            return await req.json(loads=json.loads)
+            return await req.json(
+                loads=lambda text: core.parse_json_with_repetitions(text)
+            )
         except json.JSONDecodeError as exc:
             if exc.doc == "":
                 return core.missing

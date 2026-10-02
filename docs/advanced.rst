@@ -538,6 +538,48 @@ For example, you might implement JSON PATCH according to `RFC 6902 <https://tool
         """
         # ...
 
+Parameter Cardinality
+---------------------
+
+Repeated scalar parameters are ambiguous unless an application chooses a
+policy. Different request integrations may preserve either the first or the
+last occurrence, so webargs can enforce an explicit cardinality before fields
+are deserialized.
+
+Use ``parameter_cardinality`` when constructing a parser, or pass it to
+``parse()``, ``use_args()``, or ``use_kwargs()``. The available values are:
+
+* ``ParameterCardinality.REJECT``: reject repeated scalar values, even when the
+  occurrences have identical values.
+* ``ParameterCardinality.FIRST``: use the first scalar occurrence.
+* ``ParameterCardinality.LAST``: use the last scalar occurrence.
+
+The strings ``"reject"``, ``"first"``, and ``"last"`` are also accepted. When
+no policy is supplied, webargs preserves its historical location-specific
+behavior.
+
+.. code-block:: python
+
+    from webargs import ParameterCardinality, fields
+    from webargs.flaskparser import FlaskParser
+
+    parser = FlaskParser(parameter_cardinality=ParameterCardinality.FIRST)
+
+
+    @parser.use_args({"page": fields.Int()}, location="query")
+    def view(args):
+        ...
+
+Fields declared as lists or tuples continue to collect every occurrence. For
+example, ``?tag=a&tag=b`` is still ``{"tag": ["a", "b"]}`` for a ``List``
+field. The same policy is also applied to repeated JSON object keys, including
+keys nested inside objects or arrays. Duplicate-key validation runs from the
+raw JSON text before ``json.loads`` would otherwise collapse those keys.
+
+If a framework integration or custom location loader returns an already folded
+mapping and cannot provide the original occurrences, selecting a policy raises
+a validation error instead of claiming that duplicates were checked.
+
 Multi-Field Detection
 ---------------------
 

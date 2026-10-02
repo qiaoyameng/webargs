@@ -50,14 +50,24 @@ class MultiDictProxy(MutableMapping):
         val = self.data.get(key, ma.missing)
         if val is ma.missing or key not in self.multiple_keys:
             return val
-        if hasattr(self.data, "getlist"):
-            return self.data.getlist(key)
-        if hasattr(self.data, "getall"):
-            return self.data.getall(key)
-        if isinstance(val, (list, tuple)):
+        occurrences = self.get_occurrences(key)
+        if not occurrences:
             return val
+        return occurrences
+
+    def get_occurrences(self, key: str) -> list[typing.Any]:
+        """Return all request occurrences for ``key`` in request order."""
+        val = self.data.get(key, ma.missing)
+        if val is ma.missing:
+            return []
+        if hasattr(self.data, "getlist"):
+            return list(self.data.getlist(key))
+        if hasattr(self.data, "getall"):
+            return list(self.data.getall(key))
+        if isinstance(val, (list, tuple)):
+            return list(val)
         if val is None:
-            return None
+            return [None]
         return [val]
 
     def __str__(self) -> str:  # str(proxy) proxies to str(proxy.data)

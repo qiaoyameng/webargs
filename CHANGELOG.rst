@@ -9,6 +9,11 @@ Features:
 * *Backwards-incompatible*: Remove ``__version__``, ``__parsed_version__``, and
   ``__version_info__`` constants from ``__init__.py`` file. Users should use
   ``importlib.metadata`` instead (:pr:`1024`).
+* Add explicit ``parameter_cardinality`` support for repeated scalar query,
+  form, and JSON values. Policies can reject duplicates, select the first
+  occurrence, or select the last occurrence while declared list fields continue
+  collecting all occurrences. JSON parsing now detects repeated keys from the
+  raw document, including in nested objects and arrays.
 
 Other changes:
 

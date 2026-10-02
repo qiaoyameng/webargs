@@ -74,7 +74,7 @@ class FlaskParser(core.Parser[flask.Request]):
         if not is_json_request(req):
             return core.missing
 
-        return core.parse_json(req.get_data(cache=True))
+        return core.parse_json_with_repetitions(req.get_data(cache=True))
 
     def _handle_invalid_json_error(
         self,

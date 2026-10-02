@@ -68,6 +68,21 @@ class WebArgsTornadoMultiDictProxy(MultiDictProxy):
         except UnicodeDecodeError as exc:
             raise HTTPError(400, f"Invalid unicode in {key}: {value[:40]!r}") from exc
 
+    def get_occurrences(self, key: str) -> list[typing.Any]:
+        value = self.data.get(key, core.missing)
+        if value is core.missing:
+            return []
+        if key in self.multiple_keys:
+            return [
+                _unicode(item) if isinstance(item, (str, bytes)) else item
+                for item in value
+            ]
+        return [
+            _unicode(value[0])
+            if isinstance(value[0], (str, bytes))
+            else value[0]
+        ]
+
 
 class WebArgsTornadoCookiesMultiDictProxy(MultiDictProxy):
     """
@@ -83,6 +98,12 @@ class WebArgsTornadoCookiesMultiDictProxy(MultiDictProxy):
         if key in self.multiple_keys:
             return [cookie.value]
         return cookie.value
+
+    def get_occurrences(self, key: str) -> list[typing.Any]:
+        cookie = self.data.get(key, core.missing)
+        if cookie is core.missing:
+            return []
+        return [cookie.value]
 
 
 class TornadoParser(core.Parser[HTTPServerRequest]):
@@ -101,7 +122,7 @@ class TornadoParser(core.Parser[HTTPServerRequest]):
         if isinstance(req.body, tornado.concurrent.Future):
             return core.missing
 
-        return core.parse_json(req.body)
+        return core.parse_json_with_repetitions(req.body)
 
     def load_querystring(self, req: HTTPServerRequest, schema: ma.Schema) -> typing.Any:
         """Return query params from the request as a MultiDictProxy."""

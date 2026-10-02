@@ -18,6 +18,8 @@ Example: ::
         run(debug=True)
 """
 
+import json
+
 import bottle
 
 from webargs import core
@@ -33,25 +35,26 @@ class BottleParser(core.Parser[bottle.Request]):
 
     def _raw_load_json(self, req):
         """Read a json payload from the request."""
+        content_type = core.get_mimetype(req.content_type or "")
+        if not (
+            core.is_json(req.content_type)
+            or content_type == "application/json-rpc"
+        ):
+            return core.missing
+        body = req.body.read()
+        if not body:
+            return core.missing
         try:
-            data = req.json
-        except AttributeError:
+            payload = core.parse_json_with_repetitions(body)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            self._handle_invalid_json_error(exc, req)
             return core.missing
-        except bottle.HTTPError as err:
-            if err.body == "Invalid JSON":
-                self._handle_invalid_json_error(err, req)
-            else:
-                raise
-
-        # unfortunately, bottle does not distinguish between an empty body, "",
-        # and a body containing the valid JSON value null, "null"
-        # so these can't be properly disambiguated
-        # as our best-effort solution, treat None as missing and ignore the
-        # (admittedly unusual) "null" case
-        # see: https://github.com/bottlepy/bottle/issues/1160
-        if data is None:
+        # Bottle does not distinguish an empty body from a body containing
+        # JSON null before the body is consumed; preserve its historical
+        # treatment of both as "no JSON body".
+        if payload.value is None:
             return core.missing
-        return data
+        return payload
 
     def load_querystring(self, req, schema):
         """Return query params from the request as a MultiDictProxy."""

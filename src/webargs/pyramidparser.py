@@ -68,7 +68,7 @@ class PyramidParser(core.Parser[Request]):
         if not is_json_request(req):
             return core.missing
 
-        return core.parse_json(req.body, encoding=req.charset)
+        return core.parse_json_with_repetitions(req.body, encoding=req.charset)
 
     def load_querystring(self, req: Request, schema: ma.Schema) -> typing.Any:
         """Return query params from the request as a MultiDictProxy."""

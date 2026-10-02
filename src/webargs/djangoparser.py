@@ -45,7 +45,7 @@ class DjangoParser(core.Parser[django.http.HttpRequest]):
         if not is_json_request(req):
             return core.missing
 
-        return core.parse_json(req.body)
+        return core.parse_json_with_repetitions(req.body)
 
     def load_querystring(self, req: django.http.HttpRequest, schema):
         """Return query params from the request as a MultiDictProxy."""

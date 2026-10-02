@@ -141,7 +141,7 @@ class FalconParser(core.Parser[falcon.Request]):
             return core.missing
         body = req.stream.read(req.content_length)
         if body:
-            return core.parse_json(body)
+            return core.parse_json_with_repetitions(body)
         return core.missing
 
     def load_headers(self, req: falcon.Request, schema):

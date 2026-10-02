@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections.abc
+import enum
 import functools
 import inspect
 import json
@@ -27,11 +28,80 @@ logger = logging.getLogger(__name__)
 
 
 __all__ = [
+    "ParameterCardinality",
+    "DuplicateValuePolicy",
     "ValidationError",
     "Parser",
     "missing",
+    "parse_json_with_repetitions",
     "parse_json",
 ]
+
+
+class ParameterCardinality(enum.Enum):
+    """Strategy for repeated scalar request parameters."""
+
+    REJECT = "reject"
+    FIRST = "first"
+    LAST = "last"
+
+    @classmethod
+    def coerce(cls, value: str | ParameterCardinality) -> ParameterCardinality:
+        if isinstance(value, ParameterCardinality):
+            return value
+        try:
+            return cls(value.lower())
+        except ValueError as exc:
+            allowed = ", ".join(policy.value for policy in cls)
+            raise ValueError(
+                f"Invalid parameter cardinality {value!r}. Choose one of: {allowed}."
+            ) from exc
+
+
+# A descriptive alias for users reading the option as a duplicate-value policy.
+DuplicateValuePolicy = ParameterCardinality
+
+
+class _RepeatedJSONDict(dict):
+    """A JSON object which retains repeated keys and their positions."""
+
+    def __init__(self, pairs: list[tuple[str, typing.Any]]):
+        super().__init__(pairs)
+        occurrences: dict[str, list[int]] = {}
+        for index, (key, _value) in enumerate(pairs, start=1):
+            occurrences.setdefault(key, []).append(index)
+        self.__webargs_pairs__ = list(pairs)
+        self.__webargs_repeated_keys__ = {
+            key: positions
+            for key, positions in occurrences.items()
+            if len(positions) > 1
+        }
+
+
+class RawJSONPayload:
+    """Marker for JSON data parsed from raw text with repetition metadata."""
+
+    def __init__(self, value: typing.Any) -> None:
+        self.value = value
+
+
+def _repeated_json_pairs_hook(
+    pairs: list[tuple[str, typing.Any]],
+) -> _RepeatedJSONDict:
+    return _RepeatedJSONDict(pairs)
+
+
+def _decode_json_document(s: typing.AnyStr, *, encoding: str) -> str:
+    if isinstance(s, str):
+        return s
+    try:
+        return s.decode(encoding)
+    except UnicodeDecodeError as exc:
+        raise json.JSONDecodeError(
+            f"Bytes decoding error : {exc.reason}",
+            doc=str(exc.object),
+            pos=exc.start,
+        ) from exc
 
 
 # a type var for library-provided request types
@@ -102,18 +172,442 @@ def is_json(mimetype: str | None) -> bool:
 
 
 def parse_json(s: typing.AnyStr, *, encoding: str = "utf-8") -> typing.Any:
-    if isinstance(s, str):
-        decoded = s
-    else:
-        try:
-            decoded = s.decode(encoding)
-        except UnicodeDecodeError as exc:
-            raise json.JSONDecodeError(
-                f"Bytes decoding error : {exc.reason}",
-                doc=str(exc.object),
-                pos=exc.start,
-            ) from exc
+    decoded = _decode_json_document(s, encoding=encoding)
     return json.loads(decoded)
+
+
+def parse_json_with_repetitions(
+    s: typing.AnyStr, *, encoding: str = "utf-8"
+) -> RawJSONPayload:
+    """Parse JSON without discarding repeated object keys."""
+    decoded = _decode_json_document(s, encoding=encoding)
+    value = json.loads(
+        decoded, object_pairs_hook=_repeated_json_pairs_hook
+    )
+    return RawJSONPayload(value)
+
+
+def _repeated_key_positions(mapping: typing.Any) -> dict[str, list[int]]:
+    return getattr(mapping, "__webargs_repeated_keys__", {})
+
+
+def _repeated_key_values(
+    mapping: _RepeatedJSONDict, key: str
+) -> list[typing.Any]:
+    return [value for candidate, value in mapping.__webargs_pairs__ if candidate == key]
+
+
+def _is_multi_value_field(parser: Parser, field: ma.fields.Field) -> bool:
+    is_multiple_attr = getattr(field, "is_multiple", None)
+    if is_multiple_attr is not None:
+        return is_multiple_attr
+    return isinstance(field, tuple(parser.KNOWN_MULTI_FIELDS))
+
+
+def _schema_field_for_key(
+    schema: ma.Schema | None, key: str
+) -> ma.fields.Field | None:
+    if schema is None:
+        return None
+    field = schema.fields.get(key)
+    if field is not None:
+        return field
+    for candidate in schema.fields.values():
+        if candidate.data_key == key:
+            return candidate
+    return None
+
+
+def _record_path_error(
+    errors: dict,
+    path: tuple[typing.Any, ...],
+    message: str,
+) -> None:
+    if not path:
+        raise ValueError("An error path must contain at least one segment.")
+    *parent_path, terminal = path
+    current = errors
+    for key in parent_path:
+        node = current.setdefault(key, {})
+        if not isinstance(node, dict):
+            node = {}
+            current[key] = node
+        current = node
+    messages = current.setdefault(terminal, [])
+    if not isinstance(messages, list):
+        messages = []
+        current[terminal] = messages
+    messages.append(message)
+
+
+def _repetition_message(
+    source: str, path: tuple[typing.Any, ...], positions: typing.Sequence[int]
+) -> str:
+    rendered_path = ".".join(str(part) for part in path)
+    occurrence_count = len(positions)
+    ordinal_text = ", ".join(str(position) for position in positions)
+    return (
+        f"Duplicate {source} parameter at {rendered_path}: "
+        f"{occurrence_count} occurrences found at positions {ordinal_text}."
+    )
+
+
+def _flatten_occurrences(values: list[typing.Any]) -> list[typing.Any]:
+    result: list[typing.Any] = []
+    for value in values:
+        if isinstance(value, (list, tuple)):
+            result.extend(value)
+        else:
+            result.append(value)
+    return result
+
+
+def _nested_field_schema(field: ma.fields.Field) -> ma.Schema | None:
+    if isinstance(field, ma.fields.Nested):
+        return field.schema
+    inner = getattr(field, "inner", None)
+    if isinstance(inner, ma.fields.Nested):
+        return inner.schema
+    return None
+
+
+def _normalize_nested_json(
+    parser: Parser,
+    value: typing.Any,
+    schema: ma.Schema,
+    many: bool,
+    policy: ParameterCardinality,
+    source: str,
+    path: tuple[typing.Any, ...],
+    errors: dict,
+) -> typing.Any:
+    if many and isinstance(value, list):
+        return [
+            _normalize_json_value(
+                parser,
+                item,
+                schema,
+                policy,
+                source,
+                (*path, index),
+                errors,
+            )
+            for index, item in enumerate(value)
+        ]
+    return _normalize_json_value(
+        parser,
+        value,
+        schema,
+        policy,
+        source,
+        path,
+        errors,
+    )
+
+
+def _normalize_list_field_value(
+    parser: Parser,
+    value: typing.Any,
+    field: ma.fields.Field,
+    policy: ParameterCardinality,
+    source: str,
+    path: tuple[typing.Any, ...],
+    errors: dict,
+) -> typing.Any:
+    if not isinstance(value, list):
+        return _normalize_json_value(
+            parser, value, None, policy, source, path, errors
+        )
+
+    if isinstance(field, ma.fields.Tuple):
+        result = []
+        tuple_fields = getattr(field, "tuple_fields", [])
+        for index, item in enumerate(value):
+            item_field = tuple_fields[index] if index < len(tuple_fields) else None
+            item_schema = _nested_field_schema(item_field) if item_field else None
+            if item_schema is not None:
+                normalized = _normalize_nested_json(
+                    parser,
+                    item,
+                    item_schema,
+                    bool(getattr(item_field, "many", False)),
+                    policy,
+                    source,
+                    (*path, index),
+                    errors,
+                )
+            else:
+                normalized = _normalize_json_value(
+                    parser,
+                    item,
+                    None,
+                    policy,
+                    source,
+                    (*path, index),
+                    errors,
+                )
+            result.append(normalized)
+        return result
+
+    item_schema = _nested_field_schema(field)
+    if item_schema is not None:
+        inner_many = bool(getattr(field.inner, "many", False))
+        return [
+            _normalize_nested_json(
+                parser,
+                item,
+                item_schema,
+                inner_many,
+                policy,
+                source,
+                (*path, index),
+                errors,
+            )
+            for index, item in enumerate(value)
+        ]
+
+    return [
+        _normalize_json_value(
+            parser, item, None, policy, source, (*path, index), errors
+        )
+        for index, item in enumerate(value)
+    ]
+
+
+def _normalize_field_value(
+    parser: Parser,
+    value: typing.Any,
+    field: ma.fields.Field | None,
+    policy: ParameterCardinality,
+    source: str,
+    path: tuple[typing.Any, ...],
+    errors: dict,
+) -> typing.Any:
+    if field is None:
+        return _normalize_json_value(
+            parser, value, None, policy, source, path, errors
+        )
+    if isinstance(field, ma.fields.Nested):
+        return _normalize_nested_json(
+            parser,
+            value,
+            field.schema,
+            field.many,
+            policy,
+            source,
+            path,
+            errors,
+        )
+    if isinstance(field, (ma.fields.List, ma.fields.Tuple)):
+        return _normalize_list_field_value(
+            parser, value, field, policy, source, path, errors
+        )
+    return _normalize_json_value(
+        parser, value, None, policy, source, path, errors
+    )
+
+
+def _normalize_json_value(
+    parser: Parser,
+    value: typing.Any,
+    schema: ma.Schema | None,
+    policy: ParameterCardinality,
+    source: str,
+    path: tuple[typing.Any, ...],
+    errors: dict,
+) -> typing.Any:
+    if isinstance(value, RawJSONPayload):
+        value = value.value
+
+    if isinstance(value, _RepeatedJSONDict):
+        result = {}
+        repeated = _repeated_key_positions(value)
+        for key, occurrences in repeated.items():
+            field = _schema_field_for_key(schema, key)
+            if field is not None and _is_multi_value_field(parser, field):
+                continue
+            if policy is ParameterCardinality.REJECT:
+                _record_path_error(
+                    errors,
+                    (*path, key),
+                    _repetition_message(source, (*path, key), occurrences),
+                )
+
+        seen: set[str] = set()
+        for key, child in value.__webargs_pairs__:
+            if key in seen:
+                continue
+            seen.add(key)
+            field = _schema_field_for_key(schema, key)
+            child_path = (*path, key)
+
+            if key in repeated:
+                raw_occurrences = _repeated_key_values(value, key)
+                normalized_occurrences = []
+                if field is not None and _is_multi_value_field(parser, field):
+                    for occurrence in raw_occurrences:
+                        normalized_occurrences.append(
+                            _normalize_field_value(
+                                parser,
+                                occurrence,
+                                field,
+                                policy,
+                                source,
+                                child_path,
+                                errors,
+                            )
+                        )
+                    normalized = _flatten_occurrences(normalized_occurrences)
+                else:
+                    selected = (
+                        raw_occurrences[0]
+                        if policy is ParameterCardinality.FIRST
+                        else raw_occurrences[-1]
+                    )
+                    normalized = _normalize_field_value(
+                        parser,
+                        selected,
+                        field,
+                        policy,
+                        source,
+                        child_path,
+                        errors,
+                    )
+            else:
+                normalized = _normalize_field_value(
+                    parser,
+                    child,
+                    field,
+                    policy,
+                    source,
+                    child_path,
+                    errors,
+                )
+            result[key] = normalized
+        return result
+
+    if isinstance(value, collections.abc.Mapping):
+        _record_path_error(
+            errors,
+            (*path, "_schema"),
+            _unavailable_repetition_message(source),
+        )
+        return {
+            key: _normalize_json_value(
+                parser,
+                child,
+                None,
+                policy,
+                source,
+                (*path, key),
+                errors,
+            )
+            for key, child in value.items()
+        }
+
+    if isinstance(value, list):
+        return [
+            _normalize_json_value(
+                parser,
+                item,
+                None,
+                policy,
+                source,
+                (*path, index),
+                errors,
+            )
+            for index, item in enumerate(value)
+        ]
+
+    return value
+
+
+def _normalize_json_data(
+    parser: Parser,
+    payload: RawJSONPayload,
+    schema: ma.Schema,
+    policy: ParameterCardinality,
+    source: str,
+) -> typing.Any:
+    errors: dict = {}
+    if schema.many and isinstance(payload.value, list):
+        normalized = [
+            _normalize_json_value(
+                parser,
+                item,
+                schema,
+                policy,
+                source,
+                (index,),
+                errors,
+            )
+            for index, item in enumerate(payload.value)
+        ]
+    else:
+        normalized = _normalize_json_value(
+            parser,
+            payload.value,
+            schema,
+            policy,
+            source,
+            (),
+            errors,
+        )
+    if errors:
+        raise ValidationError(errors)
+    return normalized
+
+
+def _plain_json_value(value: typing.Any) -> typing.Any:
+    if isinstance(value, RawJSONPayload):
+        value = value.value
+    if isinstance(
+        value, (_RepeatedJSONDict, collections.abc.Mapping)
+    ):
+        return {key: _plain_json_value(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_plain_json_value(item) for item in value]
+    return value
+
+
+def _unavailable_repetition_message(source: str) -> str:
+    return (
+        f"Cannot enforce scalar parameter cardinality for {source}: the request "
+        "location only provides a collapsed value and raw occurrences are unavailable."
+    )
+
+
+def _normalize_multidict_data(
+    parser: Parser,
+    data: MultiDictProxy,
+    schema: ma.Schema,
+    policy: ParameterCardinality,
+    source: str,
+) -> dict[str, typing.Any]:
+    result: dict[str, typing.Any] = {}
+    errors: dict = {}
+    for key in data:
+        occurrences = data.get_occurrences(key)
+        field = _schema_field_for_key(schema, key)
+        is_multiple = field is not None and _is_multi_value_field(parser, field)
+        if is_multiple:
+            result[key] = _flatten_occurrences(occurrences)
+            continue
+        if len(occurrences) > 1 and policy is ParameterCardinality.REJECT:
+            _record_path_error(
+                errors,
+                (key,),
+                _repetition_message(
+                    source,
+                    (key,),
+                    list(range(1, len(occurrences) + 1)),
+                ),
+            )
+        selected_index = 0 if policy is ParameterCardinality.FIRST else -1
+        result[key] = occurrences[selected_index]
+    if errors:
+        raise ValidationError(errors)
+    return result
 
 
 def _ensure_list_of_callables(obj: typing.Any) -> CallableList:
@@ -142,6 +636,8 @@ class Parser(typing.Generic[Request]):
         schema's ``load`` method. Defaults to ``marshmallow.EXCLUDE`` for non-body
         locations and ``marshmallow.RAISE`` for request bodies. Pass ``None`` to use the
         schema's setting instead.
+    :param parameter_cardinality: Reject, select the first occurrence of, or select
+        the last occurrence of repeated scalar parameters.
     :param callable error_handler: Custom error handler function.
     """
 
@@ -188,6 +684,7 @@ class Parser(typing.Generic[Request]):
         location: str | None = None,
         *,
         unknown: str | None = _UNKNOWN_DEFAULT_PARAM,
+        parameter_cardinality: ParameterCardinality | str | None = None,
         error_handler: ErrorHandler | None = None,
         schema_class: type[ma.Schema] | None = None,
     ) -> None:
@@ -195,6 +692,11 @@ class Parser(typing.Generic[Request]):
         self.error_callback: ErrorHandler | None = _callable_or_raise(error_handler)
         self.schema_class = schema_class or self.DEFAULT_SCHEMA_CLASS
         self.unknown = unknown
+        self.parameter_cardinality = (
+            ParameterCardinality.coerce(parameter_cardinality)
+            if parameter_cardinality is not None
+            else None
+        )
 
     def _makeproxy(
         self,
@@ -343,8 +845,15 @@ class Parser(typing.Generic[Request]):
         req: Request | None = None,
         location: str | None = None,
         unknown: str | None = _UNKNOWN_DEFAULT_PARAM,
+        parameter_cardinality: ParameterCardinality | str | None = None,
         validate: ValidateArg = None,
-    ) -> tuple[None, Request, str, CallableList, ma.Schema]:
+    ) -> tuple[
+        Request,
+        str,
+        CallableList,
+        ma.Schema,
+        ParameterCardinality | None,
+    ]:
         # validate parse() arguments and handle defaults
         # (shared between sync and async variants)
         req = req if req is not None else self.get_default_request()
@@ -353,7 +862,12 @@ class Parser(typing.Generic[Request]):
         location = location or self.location
         validators = _ensure_list_of_callables(validate)
         schema = self._get_schema(argmap, req)
-        return (None, req, location, validators, schema)
+        cardinality = (
+            ParameterCardinality.coerce(parameter_cardinality)
+            if parameter_cardinality is not None
+            else self.parameter_cardinality
+        )
+        return (req, location, validators, schema, cardinality)
 
     def _process_location_data(
         self,
@@ -362,6 +876,7 @@ class Parser(typing.Generic[Request]):
         req: Request,
         location: str,
         unknown: str | None,
+        parameter_cardinality: ParameterCardinality | None,
         validators: CallableList,
     ) -> typing.Any:
         # after the data has been fetched from a registered location,
@@ -373,6 +888,35 @@ class Parser(typing.Generic[Request]):
         # (e.g. optional JSON body) work smoothly
         if location_data is missing:
             location_data = {}
+
+        if isinstance(location_data, RawJSONPayload):
+            if parameter_cardinality is None:
+                location_data = _plain_json_value(location_data)
+            else:
+                source = "querystring" if location == "query" else location
+                location_data = _normalize_json_data(
+                    self,
+                    location_data,
+                    schema,
+                    parameter_cardinality,
+                source,
+            )
+        elif parameter_cardinality is not None:
+            source = location
+            if isinstance(location_data, MultiDictProxy):
+                location_data = _normalize_multidict_data(
+                    self,
+                    location_data,
+                    schema,
+                    parameter_cardinality,
+                    source,
+                )
+            elif location_data == {}:
+                location_data = {}
+            else:
+                raise ValidationError(
+                    {"_schema": [_unavailable_repetition_message(source)]}
+                )
 
         # precedence order: explicit, instance setting, default per location
         unknown = (
@@ -399,6 +943,7 @@ class Parser(typing.Generic[Request]):
         *,
         location: str | None = None,
         unknown: str | None = _UNKNOWN_DEFAULT_PARAM,
+        parameter_cardinality: ParameterCardinality | str | None = None,
         validate: ValidateArg = None,
         error_status_code: int | None = None,
         error_headers: typing.Mapping[str, str] | None = None,
@@ -417,6 +962,7 @@ class Parser(typing.Generic[Request]):
             schema's ``load`` method. Defaults to ``marshmallow.EXCLUDE`` for non-body
             locations and ``marshmallow.RAISE`` for request bodies. Pass ``None`` to use
             the schema's setting instead.
+        :param parameter_cardinality: Repeated scalar parameter strategy.
         :param callable validate: Validation function or list of validation functions
             that receives the dictionary of parsed arguments. Validator either returns a
             boolean or raises a :exc:`ValidationError`.
@@ -427,15 +973,32 @@ class Parser(typing.Generic[Request]):
 
          :return: A dictionary of parsed arguments
         """
-        data, req, location, validators, schema = self._prepare_for_parse(
-            argmap, req, location, unknown, validate
+        (
+            req,
+            location,
+            validators,
+            schema,
+            cardinality,
+        ) = self._prepare_for_parse(
+            argmap,
+            req,
+            location,
+            unknown,
+            parameter_cardinality,
+            validate,
         )
         try:
             location_data = self._load_location_data(
                 schema=schema, req=req, location=location
             )
             data = self._process_location_data(
-                location_data, schema, req, location, unknown, validators
+                location_data,
+                schema,
+                req,
+                location,
+                unknown,
+                cardinality,
+                validators,
             )
         except ma.exceptions.ValidationError as error:
             self._on_validation_error(
@@ -458,6 +1021,7 @@ class Parser(typing.Generic[Request]):
         *,
         location: str | None = None,
         unknown: str | None = _UNKNOWN_DEFAULT_PARAM,
+        parameter_cardinality: ParameterCardinality | str | None = None,
         validate: ValidateArg = None,
         error_status_code: int | None = None,
         error_headers: typing.Mapping[str, str] | None = None,
@@ -466,15 +1030,32 @@ class Parser(typing.Generic[Request]):
 
         Receives the same arguments as `webargs.core.Parser.parse`.
         """
-        data, req, location, validators, schema = self._prepare_for_parse(
-            argmap, req, location, unknown, validate
+        (
+            req,
+            location,
+            validators,
+            schema,
+            cardinality,
+        ) = self._prepare_for_parse(
+            argmap,
+            req,
+            location,
+            unknown,
+            parameter_cardinality,
+            validate,
         )
         try:
             location_data = await self._async_load_location_data(
                 schema=schema, req=req, location=location
             )
             data = self._process_location_data(
-                location_data, schema, req, location, unknown, validators
+                location_data,
+                schema,
+                req,
+                location,
+                unknown,
+                cardinality,
+                validators,
             )
         except ma.exceptions.ValidationError as error:
             await self._async_on_validation_error(
@@ -543,6 +1124,7 @@ class Parser(typing.Generic[Request]):
         *,
         location: str | None = None,
         unknown: str | None = _UNKNOWN_DEFAULT_PARAM,
+        parameter_cardinality: ParameterCardinality | str | None = None,
         as_kwargs: bool = False,
         arg_name: str | None = None,
         validate: ValidateArg = None,
@@ -564,6 +1146,7 @@ class Parser(typing.Generic[Request]):
         :param str location: Where on the request to load values.
         :param str unknown: A value to pass for ``unknown`` when calling the
             schema's ``load`` method.
+        :param parameter_cardinality: Repeated scalar parameter strategy.
         :param bool as_kwargs: Whether to insert arguments as keyword arguments.
         :param str arg_name: Keyword argument name to use for arguments. Mutually
             exclusive with as_kwargs.
@@ -619,6 +1202,7 @@ class Parser(typing.Generic[Request]):
                         req=req_obj,
                         location=location,
                         unknown=unknown,
+                        parameter_cardinality=parameter_cardinality,
                         validate=validate,
                         error_status_code=error_status_code,
                         error_headers=error_headers,
@@ -642,6 +1226,7 @@ class Parser(typing.Generic[Request]):
                         req=req_obj,
                         location=location,
                         unknown=unknown,
+                        parameter_cardinality=parameter_cardinality,
                         validate=validate,
                         error_status_code=error_status_code,
                         error_headers=error_headers,
@@ -664,6 +1249,7 @@ class Parser(typing.Generic[Request]):
         *,
         location: str | None = None,
         unknown: str | None = _UNKNOWN_DEFAULT_PARAM,
+        parameter_cardinality: ParameterCardinality | str | None = None,
         validate: ValidateArg = None,
         error_status_code: int | None = None,
         error_headers: typing.Mapping[str, str] | None = None,
@@ -688,6 +1274,7 @@ class Parser(typing.Generic[Request]):
             as_kwargs=True,
             location=location,
             unknown=unknown,
+            parameter_cardinality=parameter_cardinality,
             validate=validate,
             error_status_code=error_status_code,
             error_headers=error_headers,
