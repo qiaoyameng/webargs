@@ -17,7 +17,14 @@ from marshmallow import (
 from werkzeug.datastructures import MultiDict as WerkMultiDict
 
 from webargs import ValidationError, fields
-from webargs.core import Parser, get_mimetype, is_json
+from webargs.core import (
+    NDJSONRecordError,
+    NDJSONResult,
+    Parser,
+    get_mimetype,
+    is_json,
+    is_ndjson,
+)
 from webargs.multidictproxy import MultiDictProxy
 
 
@@ -43,6 +50,9 @@ class MockRequestParser(Parser):
     def load_cookies(self, req, schema):
         return req.cookies
 
+    def _raw_load_ndjson(self, req):
+        return req.stream
+
 
 @pytest.fixture(scope="function")
 def web_request():
@@ -55,6 +65,30 @@ def web_request():
 @pytest.fixture
 def parser():
     return MockRequestParser()
+
+
+class NameSchema(Schema):
+    name = fields.Str(required=True)
+
+
+class ChunkedReadStream:
+    def __init__(self, data, *, fail_after_reads=0, exception=None):
+        self.data = data
+        self.read_calls = []
+        self.closed = False
+        self.fail_after_reads = fail_after_reads
+        self.exception = exception or ConnectionError("client disconnected")
+
+    def read(self, size=-1):
+        self.read_calls.append(size)
+        if self.fail_after_reads and len(self.read_calls) > self.fail_after_reads:
+            raise self.exception
+        chunk = self.data[:size]
+        self.data = self.data[size:]
+        return chunk
+
+    def close(self):
+        self.closed = True
 
 
 # Parser tests
@@ -1707,3 +1741,235 @@ def test_default_arg_name_pattern_can_pull_schema_attribute(web_request):
 
     web_request.json = {"length": 6, "width": 7}
     assert area() == 42
+
+
+@pytest.mark.parametrize(
+    ("mimetype", "expected"),
+    [
+        ("application/x-ndjson", True),
+        ("application/ndjson", True),
+        ("application/jsonl", True),
+        ("application/vnd.api+ndjson; charset=utf-8", True),
+        ("application/json", False),
+        ("text/plain", False),
+    ],
+)
+def test_is_ndjson(mimetype, expected):
+    assert is_ndjson(mimetype) is expected
+
+
+def test_parse_ndjson_is_lazy_until_iteration(parser, web_request):
+    stream = ChunkedReadStream(b'{"name": "Ann"}')
+    web_request.stream = stream
+
+    records = parser.parse_ndjson(NameSchema(), web_request)
+
+    assert stream.read_calls == []
+    with records:
+        assert next(records) == {"name": "Ann"}
+        assert stream.read_calls == [8192, 8192]
+
+
+def test_parse_ndjson_fail_fast_keeps_consumed_success(parser, web_request):
+    data = b'{"name":"Jos\xc3\xa9"}\n\n{"name":42}\n{"name":"Ann"}'
+    stream = ChunkedReadStream(data)
+    web_request.stream = stream
+
+    records = parser.parse_ndjson(
+        NameSchema(),
+        web_request,
+        chunk_size=13,
+    )
+
+    assert stream.read_calls == []
+    with records:
+        assert next(records) == {"name": "José"}
+        assert stream.read_calls == [13, 13]
+
+        with pytest.raises(ValidationError) as exc_info:
+            next(records)
+
+    error = exc_info.value
+    assert isinstance(error, NDJSONRecordError)
+    assert error.line_number == 3
+    assert error.field_path == "name"
+    assert error.messages == {
+        "ndjson": {"name": ["Not a valid string."]}
+    }
+    assert stream.read_calls == [13, 13, 13, 13]
+    assert stream.closed is True
+
+
+def test_parse_ndjson_collects_errors_and_continues(parser, web_request):
+    data = b'{"name":"Jos\xc3\xa9"}\n\n{"name":42}\n{"name":"Ann"}'
+    stream = ChunkedReadStream(data)
+    web_request.stream = stream
+
+    records = parser.parse_ndjson(
+        NameSchema(),
+        web_request,
+        fail_fast=False,
+        chunk_size=13,
+    )
+
+    assert stream.read_calls == []
+    with records:
+        results = list(records)
+
+    assert len(results) == 3
+    assert results[0] == NDJSONResult.success(1, {"name": "José"})
+    assert results[1].ok is False
+    assert results[1].line_number == 3
+    assert results[1].field_path == "name"
+    assert results[1].error.messages == {"name": ["Not a valid string."]}
+    assert results[2] == NDJSONResult.success(4, {"name": "Ann"})
+    assert [line_number for line_number, value, error in results] == [1, 3, 4]
+    assert [(value, error is not None) for line_number, value, error in results] == [
+        ({"name": "José"}, False),
+        (None, True),
+        ({"name": "Ann"}, False),
+    ]
+    assert stream.read_calls == [13, 13, 13, 13, 13]
+    assert stream.closed is True
+
+
+def test_parse_ndjson_handles_final_line_without_newline(parser, web_request):
+    stream = ChunkedReadStream(b'{"name":"Ann"}', )
+    web_request.stream = stream
+
+    with parser.parse_ndjson(NameSchema(), web_request, chunk_size=5) as records:
+        assert list(records) == [{"name": "Ann"}]
+
+    assert stream.closed is True
+
+
+def test_parse_ndjson_continues_after_utf8_error(parser, web_request):
+    stream = ChunkedReadStream(b'{"name":"\xfe"}\n{"name":"Ann"}')
+    web_request.stream = stream
+
+    with parser.parse_ndjson(
+        NameSchema(),
+        web_request,
+        fail_fast=False,
+        chunk_size=5,
+    ) as records:
+        results = list(records)
+
+    assert results[0].ok is False
+    assert results[0].line_number == 1
+    assert results[1] == NDJSONResult.success(2, {"name": "Ann"})
+    assert stream.closed is True
+
+
+def test_parse_ndjson_enforces_max_line_size_without_losing_next_record(
+    parser, web_request
+):
+    stream = ChunkedReadStream(b'{"name":"TooLong"}\n{"name":"Ann"}')
+    web_request.stream = stream
+
+    with parser.parse_ndjson(
+        NameSchema(),
+        web_request,
+        fail_fast=False,
+        chunk_size=4,
+        max_line_size=14,
+    ) as records:
+        results = list(records)
+
+    assert len(results) == 2
+    assert results[0].line_number == 1
+    assert results[0].error.messages == {
+        "_ndjson": ["Line exceeds maximum line size."]
+    }
+    assert results[1] == NDJSONResult.success(2, {"name": "Ann"})
+    assert stream.closed is True
+
+
+def test_parse_ndjson_early_break_closes_stream(parser, web_request):
+    stream = ChunkedReadStream(
+        b'{"name":"Ann"}\n{"name":"Bob"}\n{"name":"Cy"}'
+    )
+    web_request.stream = stream
+
+    with parser.parse_ndjson(NameSchema(), web_request, chunk_size=8) as records:
+        assert next(records) == {"name": "Ann"}
+
+    assert stream.closed is True
+    assert stream.data != b""
+
+
+def test_parse_ndjson_view_exception_closes_stream(parser, web_request):
+    stream = ChunkedReadStream(b'{"name":"Ann"}')
+    web_request.stream = stream
+
+    with pytest.raises(RuntimeError, match="view failure"):
+        with parser.parse_ndjson(NameSchema(), web_request) as records:
+            next(records)
+            raise RuntimeError("view failure")
+
+    assert stream.closed is True
+
+
+def test_parse_ndjson_request_disconnect_closes_stream(parser, web_request):
+    stream = ChunkedReadStream(
+        b'{"name":"Ann"}\n{"name":"Bob"}', fail_after_reads=4
+    )
+    web_request.stream = stream
+
+    with parser.parse_ndjson(NameSchema(), web_request, chunk_size=5) as records:
+        assert next(records) == {"name": "Ann"}
+        with pytest.raises(ConnectionError, match="client disconnected"):
+            next(records)
+
+    assert stream.closed is True
+
+
+def test_parse_ndjson_preserves_nested_field_path(parser, web_request):
+    class NestedSchema(Schema):
+        user = fields.Nested(NameSchema())
+
+    stream = ChunkedReadStream(b'{"user":{"name":7}}')
+    web_request.stream = stream
+
+    records = parser.parse_ndjson(NestedSchema(), web_request, fail_fast=False)
+    with records:
+        result = next(records)
+
+    assert result.ok is False
+    assert result.line_number == 1
+    assert result.field_path == "user.name"
+    assert stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_async_parse_ndjson_collects_errors_and_closes(
+    parser, web_request
+):
+    class AsyncStream:
+        def __init__(self, data):
+            self.data = data
+            self.closed = False
+
+        async def read(self, size):
+            chunk = self.data[:size]
+            self.data = self.data[size:]
+            return chunk
+
+        def close(self):
+            self.closed = True
+
+    stream = AsyncStream(b'{"name":"Ann"}\n{"name":3}')
+    web_request.stream = stream
+
+    records = await parser.async_parse_ndjson(
+        NameSchema(),
+        web_request,
+        fail_fast=False,
+        chunk_size=6,
+    )
+    async with records:
+        results = [item async for item in records]
+
+    assert [result.ok for result in results] == [True, False]
+    assert results[1].line_number == 2
+    assert stream.closed is True

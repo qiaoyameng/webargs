@@ -22,6 +22,7 @@ Example: ::
 
 from __future__ import annotations
 
+import io
 import json
 import typing
 
@@ -75,6 +76,11 @@ class FlaskParser(core.Parser[flask.Request]):
             return core.missing
 
         return core.parse_json(req.get_data(cache=True))
+
+    def _raw_load_ndjson(self, req: flask.Request) -> typing.BinaryIO:
+        if not core.is_ndjson(req.mimetype):
+            return io.BytesIO()
+        return req.stream
 
     def _handle_invalid_json_error(
         self,

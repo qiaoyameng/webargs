@@ -37,6 +37,11 @@ def is_json_request(req) -> bool:
     return core.is_json(content_type)
 
 
+def is_ndjson_request(req) -> bool:
+    content_type = req.content_type
+    return core.is_ndjson(content_type)
+
+
 class HTTPUnprocessableEntity(web.HTTPClientError):
     status_code = 422
 
@@ -108,6 +113,17 @@ class AIOHTTPParser(core.Parser[web.Request]):
             return self._handle_invalid_json_error(exc, req)
         except UnicodeDecodeError as exc:
             return self._handle_invalid_json_error(exc, req)
+
+    def _raw_load_ndjson(self, req):
+        if not (req.body_exists and is_ndjson_request(req)):
+            return None
+        return req.content
+
+    @staticmethod
+    def _close_ndjson_stream(stream):
+        if stream is not None:
+            result = stream.close()
+            return result
 
     def load_headers(self, req, schema: Schema) -> MultiDictProxy:
         """Return headers from the request as a MultiDictProxy."""

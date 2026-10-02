@@ -144,6 +144,11 @@ class FalconParser(core.Parser[falcon.Request]):
             return core.parse_json(body)
         return core.missing
 
+    def _raw_load_ndjson(self, req: falcon.Request):
+        if not is_json_request(req) and not core.is_ndjson(req.content_type):
+            return None
+        return req.stream
+
     def load_headers(self, req: falcon.Request, schema):
         """Return headers from the request."""
         # Falcon only exposes headers as a dict (not multidict)

@@ -6,6 +6,8 @@ Changelog
 
 Features:
 
+* Add ``Parser.parse_ndjson()`` and ``Parser.async_parse_ndjson()`` for lazily
+  reading and validating NDJSON request bodies one record at a time.
 * *Backwards-incompatible*: Remove ``__version__``, ``__parsed_version__``, and
   ``__version_info__`` constants from ``__init__.py`` file. Users should use
   ``importlib.metadata`` instead (:pr:`1024`).

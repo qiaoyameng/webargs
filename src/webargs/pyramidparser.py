@@ -46,6 +46,10 @@ def is_json_request(req: Request) -> bool:
     return core.is_json(req.headers.get("content-type"))
 
 
+def is_ndjson_request(req: Request) -> bool:
+    return core.is_ndjson(req.headers.get("content-type"))
+
+
 class PyramidParser(core.Parser[Request]):
     """Pyramid request argument parser."""
 
@@ -69,6 +73,17 @@ class PyramidParser(core.Parser[Request]):
             return core.missing
 
         return core.parse_json(req.body, encoding=req.charset)
+
+    def _raw_load_ndjson(self, req: Request) -> typing.BinaryIO:
+        if not is_ndjson_request(req):
+            return None
+        return req.body_file
+
+    @staticmethod
+    def _close_ndjson_stream(stream: typing.BinaryIO) -> None:
+        close = getattr(stream, "close", None)
+        if close is not None:
+            close()
 
     def load_querystring(self, req: Request, schema: ma.Schema) -> typing.Any:
         """Return query params from the request as a MultiDictProxy."""

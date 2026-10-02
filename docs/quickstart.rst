@@ -121,6 +121,27 @@ Available locations include:
 - ``'cookies'``
 - ``'files'``
 
+Streaming NDJSON Bodies
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Use :meth:`Parser.parse_ndjson <webargs.core.Parser.parse_ndjson>` to read an
+NDJSON request body one line at a time. The body is not read until the returned
+iterator is advanced, so records do not need to be accumulated into a list.
+
+.. code-block:: python
+
+    with parser.parse_ndjson(RecordSchema(), request) as records:
+        for record in records:
+            process(record)
+
+Pass ``fail_fast=False`` to receive an
+::class:`NDJSONResult <webargs.core.NDJSONResult>` for each non-empty line.
+Unsuccessful results contain an
+::class:`NDJSONRecordError <webargs.core.NDJSONRecordError>` with the
+one-based ``line_number`` and ``field_path``. Use
+:meth:`Parser.async_parse_ndjson <webargs.core.Parser.async_parse_ndjson>`
+with asynchronous request streams.
+
 Validation
 ----------
 

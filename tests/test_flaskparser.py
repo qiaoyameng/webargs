@@ -191,6 +191,25 @@ def test_load_json_returns_missing_if_no_data(mimetype):
     assert parser.load_json(req, schema) is missing
 
 
+def test_parse_ndjson_from_flask_stream():
+    flask_app = Flask("testapp")
+    schema = Schema.from_dict({"name": fields.Str()})()
+
+    with flask_app.test_request_context(
+        "/batch",
+        method="post",
+        data=b'{"name":"Ann"}\n{"name":42}\n{"name":"Bob"}',
+        content_type="application/x-ndjson",
+    ):
+        records = parser.parse_ndjson(schema, fail_fast=False, chunk_size=8)
+        with records:
+            results = list(records)
+
+    assert [result.ok for result in results] == [True, False, True]
+    assert results[1].line_number == 2
+    assert results[1].field_path == "name"
+
+
 def test_abort_with_message():
     with pytest.raises(HTTPException) as excinfo:
         abort(400, message="custom error message")

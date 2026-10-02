@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import collections.abc
+import contextlib
+import dataclasses
 import functools
 import inspect
+import io
 import json
 import logging
 import typing
@@ -30,7 +33,10 @@ __all__ = [
     "ValidationError",
     "Parser",
     "missing",
+    "is_ndjson",
     "parse_json",
+    "NDJSONRecordError",
+    "NDJSONResult",
 ]
 
 
@@ -54,6 +60,9 @@ ErrorHandlerT = typing.TypeVar("ErrorHandlerT", bound="ErrorHandler")
 _UNKNOWN_DEFAULT_PARAM = "_default"
 
 DEFAULT_VALIDATION_STATUS: int = 422
+DEFAULT_NDJSON_CHUNK_SIZE: int = 8192
+DEFAULT_NDJSON_MAX_LINE_SIZE: int = 1024 * 1024
+NDJSON_LOCATION: str = "ndjson"
 
 
 def _record_arg_name(f: typing.Callable[..., typing.Any], argname: str | None) -> None:
@@ -101,6 +110,24 @@ def is_json(mimetype: str | None) -> bool:
     return False
 
 
+def is_ndjson(mimetype: str | None) -> bool:
+    """Return whether ``mimetype`` is an NDJSON media type."""
+    if not mimetype:
+        return False
+    if ";" in mimetype:
+        mimetype = get_mimetype(mimetype)
+    return (
+        mimetype
+        in {
+            "application/ndjson",
+            "application/x-ndjson",
+            "application/jsonl",
+        }
+        or mimetype.startswith("application/")
+        and mimetype.endswith("+ndjson")
+    )
+
+
 def parse_json(s: typing.AnyStr, *, encoding: str = "utf-8") -> typing.Any:
     if isinstance(s, str):
         decoded = s
@@ -114,6 +141,526 @@ def parse_json(s: typing.AnyStr, *, encoding: str = "utf-8") -> typing.Any:
                 pos=exc.start,
             ) from exc
     return json.loads(decoded)
+
+
+class NDJSONRecordError(ValidationError):
+    """A validation error in one NDJSON record."""
+
+    def __init__(
+        self,
+        message: typing.Any,
+        *,
+        line_number: int,
+        field_path: str | None = None,
+        data: typing.Any = None,
+        valid_data: typing.Any = None,
+        cause: BaseException | None = None,
+    ) -> None:
+        super().__init__(message, data=data, valid_data=valid_data)
+        self.line_number = line_number
+        self.row_number = line_number
+        self.field_path = field_path
+        self.path = field_path
+        self.cause = cause
+
+
+@dataclasses.dataclass(frozen=True)
+class NDJSONResult(typing.Generic[T]):
+    """The result of validating one non-empty NDJSON line."""
+
+    line_number: int
+    ok: bool
+    value: T | None
+    error: NDJSONRecordError | None
+
+    @classmethod
+    def success(cls, line_number: int, value: T) -> NDJSONResult[T]:
+        return cls(line_number=line_number, ok=True, value=value, error=None)
+
+    @classmethod
+    def failure(cls, error: NDJSONRecordError) -> NDJSONResult[T]:
+        return cls(
+            line_number=error.line_number,
+            ok=False,
+            value=None,
+            error=error,
+        )
+
+    @property
+    def field_path(self) -> str | None:
+        if self.error is None:
+            return None
+        return self.error.field_path
+
+    @property
+    def path(self) -> str | None:
+        if self.error is None:
+            return None
+        return self.error.path
+
+    @property
+    def line(self) -> int:
+        return self.line_number
+
+    @property
+    def row_number(self) -> int:
+        return self.line_number
+
+    @property
+    def data(self) -> T | None:
+        return self.value
+
+    @property
+    def messages(self) -> typing.Any:
+        if self.error is None:
+            return None
+        return self.error.messages
+
+    def __iter__(self) -> collections.abc.Iterator[typing.Any]:
+        yield self.line_number
+        yield self.value
+        yield self.error
+
+
+def _ndjson_field_path(messages: typing.Any) -> str | None:
+    path: list[str] = []
+    current = messages
+    while isinstance(current, dict) and current:
+        key, current = next(iter(current.items()))
+        if key == "_schema":
+            break
+        path.append(str(key))
+    return ".".join(path) or None
+
+
+_OVERSIZED_LINE: typing.Final[object] = object()
+
+
+def _read_ndjson_chunk(stream: typing.Any, chunk_size: int) -> bytes:
+    chunk = stream.read(chunk_size)
+    if inspect.isawaitable(chunk):
+        raise TypeError(
+            "Synchronous NDJSON parsing received an asynchronous stream; "
+            "use async_parse_ndjson() instead."
+        )
+    if isinstance(chunk, str):
+        return chunk.encode("utf-8")
+    return chunk
+
+
+class _NDJSONLineScanner:
+    def __init__(
+        self,
+        stream: typing.Any,
+        *,
+        chunk_size: int,
+        max_line_size: int,
+    ) -> None:
+        self.stream = stream
+        self.chunk_size = chunk_size
+        self.max_line_size = max_line_size
+        self.pending = bytearray()
+        self.discard_buffer: bytearray | None = None
+        self.line_number = 0
+        self.finished = False
+
+    def __next__(self) -> tuple[int, bytes | object]:
+        while not self.finished:
+            result = self.consume_pending()
+            if result is not None:
+                return result
+            chunk = _read_ndjson_chunk(self.stream, self.chunk_size)
+            result = self.consume_chunk(chunk)
+            if result is not None:
+                return result
+
+        result = self.finish_stream()
+        if result is not None:
+            return result
+        raise StopIteration
+
+    def consume_chunk(
+        self, chunk: bytes
+    ) -> tuple[int, bytes | object] | None:
+        if not chunk:
+            self.finished = True
+            return self.finish_stream()
+
+        if self.discard_buffer is not None:
+            return self.consume_discard_chunk(chunk)
+
+        self.pending.extend(chunk)
+        return self.consume_pending()
+
+    def consume_pending(self) -> tuple[int, bytes | object] | None:
+        if self.discard_buffer is not None:
+            return None
+        newline_index = self.pending.find(b"\n")
+        if newline_index < 0:
+            if len(self.pending) > self.max_line_size:
+                self.line_number += 1
+                self.discard_buffer = bytearray(self.pending)
+                self.pending = bytearray()
+            return None
+
+        line = bytes(self.pending[:newline_index].rstrip(b"\r"))
+        self.pending = self.pending[newline_index + 1 :]
+        self.line_number += 1
+        if len(line) > self.max_line_size:
+            return self.line_number, _OVERSIZED_LINE
+        return self.line_number, line
+
+    def consume_discard_chunk(
+        self, chunk: bytes
+    ) -> tuple[int, object] | None:
+        buffer = self.discard_buffer
+        assert buffer is not None
+        buffer.extend(chunk)
+        newline_index = buffer.find(b"\n", len(buffer) - len(chunk))
+        if newline_index < 0:
+            del buffer[: len(buffer) - self.max_line_size]
+            return None
+
+        suffix = bytes(buffer[newline_index + 1 :])
+        self.discard_buffer = None
+        self.pending = bytearray(suffix)
+        return self.line_number, _OVERSIZED_LINE
+
+    def finish_stream(self) -> tuple[int, bytes | object] | None:
+        if self.discard_buffer is not None:
+            self.discard_buffer = None
+            self.pending = bytearray()
+            return self.line_number, _OVERSIZED_LINE
+        if not self.pending:
+            return None
+        line = bytes(self.pending.rstrip(b"\r"))
+        self.pending = bytearray()
+        self.line_number += 1
+        if len(line) > self.max_line_size:
+            return self.line_number, _OVERSIZED_LINE
+        return self.line_number, line
+
+
+class _NDJSONLineIterator(
+    _NDJSONLineScanner, collections.abc.Iterator[tuple[int, bytes | object]]
+):
+    def __next__(self) -> tuple[int, bytes | object]:
+        while not self.finished:
+            chunk = _read_ndjson_chunk(self.stream, self.chunk_size)
+            result = self.consume_chunk(chunk)
+            if result is not None:
+                return result
+
+        result = self.finish_stream()
+        if result is not None:
+            return result
+        raise StopIteration
+
+
+class _AsyncNDJSONLineIterator(
+    _NDJSONLineScanner,
+    collections.abc.AsyncIterator[tuple[int, bytes | object]],
+):
+    async def __anext__(self) -> tuple[int, bytes | object]:
+        while not self.finished:
+            result = self.consume_pending()
+            if result is not None:
+                return result
+            chunk = await self.stream.read(self.chunk_size)
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8")
+            result = self.consume_chunk(chunk)
+            if result is not None:
+                return result
+
+        result = self.finish_stream()
+        if result is not None:
+            return result
+        raise StopAsyncIteration
+
+
+class NDJSONRecordReader(
+    collections.abc.Iterator[typing.Union[typing.Any, NDJSONResult[typing.Any]]]
+):
+    def __init__(
+        self,
+        *,
+        parser: Parser[typing.Any],
+        req: typing.Any,
+        schema: ma.Schema,
+        stream: typing.Any,
+        fail_fast: bool,
+        unknown: str | None,
+        chunk_size: int,
+        max_line_size: int,
+        encoding: str,
+        error_status_code: int | None,
+        error_headers: typing.Mapping[str, str] | None,
+    ) -> None:
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be greater than zero")
+        if max_line_size < 0:
+            raise ValueError("max_line_size must be non-negative")
+        self.parser = parser
+        self.req = req
+        self.schema = schema
+        self.stream = stream
+        self.fail_fast = fail_fast
+        self.load_kwargs = parser._resolve_unknown(NDJSON_LOCATION, unknown)
+        self.encoding = encoding
+        self.error_status_code = error_status_code
+        self.error_headers = error_headers
+        self.closed = False
+        self.lines = _NDJSONLineIterator(
+            stream,
+            chunk_size=chunk_size,
+            max_line_size=max_line_size,
+        )
+
+    def __iter__(self) -> NDJSONRecordReader[typing.Any]:
+        return self
+
+    def __next__(self) -> typing.Any:
+        while True:
+            try:
+                line_number, raw_line = next(self.lines)
+                if raw_line is _OVERSIZED_LINE:
+                    error = self._oversized_error(line_number)
+                    if self.fail_fast:
+                        self._handle_error(error)
+                    return NDJSONResult.failure(error)
+                if not raw_line:
+                    continue
+                return self._load_line(line_number, typing.cast(bytes, raw_line))
+            except NDJSONRecordError as error:
+                self._handle_error(error)
+            except Exception:
+                self.close()
+                raise
+
+    def _load_line(
+        self, line_number: int, raw_line: bytes
+    ) -> typing.Any | NDJSONResult[typing.Any]:
+        try:
+            decoded = raw_line.decode(self.encoding)
+            document = json.loads(decoded)
+            preprocessed = self.parser.pre_load(
+                document,
+                schema=self.schema,
+                req=self.req,
+                location=NDJSON_LOCATION,
+            )
+            value = self.schema.load(preprocessed, **self.load_kwargs)
+        except ValidationError as error:
+            record_error = NDJSONRecordError(
+                error.messages,
+                line_number=line_number,
+                field_path=_ndjson_field_path(error.messages),
+                data=getattr(error, "data", None),
+                valid_data=getattr(error, "valid_data", None),
+                cause=error,
+            )
+            if self.fail_fast:
+                raise record_error from error
+            return NDJSONResult.failure(record_error)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            record_error = NDJSONRecordError(
+                {"_ndjson": [str(error)]},
+                line_number=line_number,
+                field_path=None,
+                data=None,
+                valid_data=None,
+                cause=error,
+            )
+            if self.fail_fast:
+                raise record_error from error
+            return NDJSONResult.failure(record_error)
+
+        if self.fail_fast:
+            return value
+        return NDJSONResult.success(line_number, value)
+
+    @staticmethod
+    def _oversized_error(line_number: int) -> NDJSONRecordError:
+        return NDJSONRecordError(
+            {"_ndjson": ["Line exceeds maximum line size."]},
+            line_number=line_number,
+            field_path=None,
+        )
+
+    def _handle_error(self, error: NDJSONRecordError) -> typing.NoReturn:
+        self.close()
+        self.parser._on_validation_error(
+            error,
+            self.req,
+            self.schema,
+            NDJSON_LOCATION,
+            error_status_code=self.error_status_code,
+            error_headers=self.error_headers,
+        )
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        with contextlib.suppress(Exception):
+            self.parser._close_ndjson_stream(self.stream)
+
+    def __enter__(self) -> NDJSONRecordReader[typing.Any]:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: typing.Any,
+    ) -> None:
+        self.close()
+
+
+class AsyncNDJSONRecordReader(
+    collections.abc.AsyncIterator[
+        typing.Union[typing.Any, NDJSONResult[typing.Any]]
+    ]
+):
+    def __init__(
+        self,
+        *,
+        parser: Parser[typing.Any],
+        req: typing.Any,
+        schema: ma.Schema,
+        stream: typing.Any,
+        fail_fast: bool,
+        unknown: str | None,
+        chunk_size: int,
+        max_line_size: int,
+        encoding: str,
+        error_status_code: int | None,
+        error_headers: typing.Mapping[str, str] | None,
+    ) -> None:
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be greater than zero")
+        if max_line_size < 0:
+            raise ValueError("max_line_size must be non-negative")
+        self.parser = parser
+        self.req = req
+        self.schema = schema
+        self.stream = stream
+        self.fail_fast = fail_fast
+        self.load_kwargs = parser._resolve_unknown(NDJSON_LOCATION, unknown)
+        self.encoding = encoding
+        self.error_status_code = error_status_code
+        self.error_headers = error_headers
+        self.closed = False
+        self.lines = _AsyncNDJSONLineIterator(
+            stream,
+            chunk_size=chunk_size,
+            max_line_size=max_line_size,
+        )
+
+    def __aiter__(self) -> AsyncNDJSONRecordReader[typing.Any]:
+        return self
+
+    async def __anext__(self) -> typing.Any:
+        while True:
+            try:
+                line_number, raw_line = await self.lines.__anext__()
+                if raw_line is _OVERSIZED_LINE:
+                    error = self._oversized_error(line_number)
+                    if self.fail_fast:
+                        await self._handle_error(error)
+                    return NDJSONResult.failure(error)
+                if not raw_line:
+                    continue
+                return await self._load_line(
+                    line_number, typing.cast(bytes, raw_line)
+                )
+            except NDJSONRecordError as error:
+                await self._handle_error(error)
+            except Exception:
+                await self.aclose()
+                raise
+
+    async def _load_line(
+        self, line_number: int, raw_line: bytes
+    ) -> typing.Any | NDJSONResult[typing.Any]:
+        try:
+            decoded = raw_line.decode(self.encoding)
+            document = json.loads(decoded)
+            preprocessed = self.parser.pre_load(
+                document,
+                schema=self.schema,
+                req=self.req,
+                location=NDJSON_LOCATION,
+            )
+            value = self.schema.load(preprocessed, **self.load_kwargs)
+        except ValidationError as error:
+            record_error = NDJSONRecordError(
+                error.messages,
+                line_number=line_number,
+                field_path=_ndjson_field_path(error.messages),
+                data=getattr(error, "data", None),
+                valid_data=getattr(error, "valid_data", None),
+                cause=error,
+            )
+            if self.fail_fast:
+                raise record_error from error
+            return NDJSONResult.failure(record_error)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            record_error = NDJSONRecordError(
+                {"_ndjson": [str(error)]},
+                line_number=line_number,
+                field_path=None,
+                data=None,
+                valid_data=None,
+                cause=error,
+            )
+            if self.fail_fast:
+                raise record_error from error
+            return NDJSONResult.failure(record_error)
+
+        if self.fail_fast:
+            return value
+        return NDJSONResult.success(line_number, value)
+
+    @staticmethod
+    def _oversized_error(line_number: int) -> NDJSONRecordError:
+        return NDJSONRecordError(
+            {"_ndjson": ["Line exceeds maximum line size."]},
+            line_number=line_number,
+            field_path=None,
+        )
+
+    async def _handle_error(self, error: NDJSONRecordError) -> typing.NoReturn:
+        await self.aclose()
+        await self.parser._async_on_validation_error(
+            error,
+            self.req,
+            self.schema,
+            NDJSON_LOCATION,
+            error_status_code=self.error_status_code,
+            error_headers=self.error_headers,
+        )
+
+    async def aclose(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        with contextlib.suppress(Exception):
+            result = self.parser._close_ndjson_stream(self.stream)
+            if inspect.isawaitable(result):
+                await result
+
+    async def __aenter__(self) -> AsyncNDJSONRecordReader[typing.Any]:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: typing.Any,
+    ) -> None:
+        await self.aclose()
 
 
 def _ensure_list_of_callables(obj: typing.Any) -> CallableList:
@@ -150,6 +697,7 @@ class Parser(typing.Generic[Request]):
     #: Default value to use for 'unknown' on schema load
     #  on a per-location basis
     DEFAULT_UNKNOWN_BY_LOCATION: dict[str, str | None] = {
+        "ndjson": None,
         "json": None,
         "form": None,
         "json_or_form": None,
@@ -391,6 +939,117 @@ class Parser(typing.Generic[Request]):
         data = schema.load(preprocessed_data, **load_kwargs)
         self._validate_arguments(data, validators)
         return data
+
+    def _prepare_for_ndjson_parse(
+        self,
+        argmap: ArgMap[Request],
+        req: Request | None,
+        unknown: str | None,
+    ) -> tuple[Request, ma.Schema]:
+        req = req if req is not None else self.get_default_request()
+        if req is None:
+            raise ValueError("Must pass req object")
+        schema = self._get_schema(argmap, req)
+        return req, schema
+
+    def _resolve_unknown(
+        self, location: str, unknown: str | None
+    ) -> dict[str, typing.Any]:
+        resolved_unknown = (
+            unknown
+            if unknown != _UNKNOWN_DEFAULT_PARAM
+            else (
+                self.unknown
+                if self.unknown != _UNKNOWN_DEFAULT_PARAM
+                else self.DEFAULT_UNKNOWN_BY_LOCATION.get(location)
+            )
+        )
+        return {"unknown": resolved_unknown} if resolved_unknown else {}
+
+    def parse_ndjson(
+        self,
+        argmap: ArgMap[Request],
+        req: Request | None = None,
+        *,
+        fail_fast: bool = True,
+        unknown: str | None = _UNKNOWN_DEFAULT_PARAM,
+        chunk_size: int = DEFAULT_NDJSON_CHUNK_SIZE,
+        max_line_size: int = DEFAULT_NDJSON_MAX_LINE_SIZE,
+        encoding: str = "utf-8",
+        error_status_code: int | None = None,
+        error_headers: typing.Mapping[str, str] | None = None,
+    ) -> NDJSONRecordReader[typing.Any]:
+        """Return a context-managed iterator of validated NDJSON records.
+
+        The request body is not read until the returned iterator is advanced.
+        """
+        request, schema = self._prepare_for_ndjson_parse(argmap, req, unknown)
+        stream = self._raw_load_ndjson(request)
+        if stream is None:
+            stream = io.BytesIO()
+        return NDJSONRecordReader(
+            parser=self,
+            req=request,
+            schema=schema,
+            stream=stream,
+            fail_fast=fail_fast,
+            unknown=unknown,
+            chunk_size=chunk_size,
+            max_line_size=max_line_size,
+            encoding=encoding,
+            error_status_code=error_status_code,
+            error_headers=error_headers,
+        )
+
+    async def async_parse_ndjson(
+        self,
+        argmap: ArgMap[Request],
+        req: Request | None = None,
+        *,
+        fail_fast: bool = True,
+        unknown: str | None = _UNKNOWN_DEFAULT_PARAM,
+        chunk_size: int = DEFAULT_NDJSON_CHUNK_SIZE,
+        max_line_size: int = DEFAULT_NDJSON_MAX_LINE_SIZE,
+        encoding: str = "utf-8",
+        error_status_code: int | None = None,
+        error_headers: typing.Mapping[str, str] | None = None,
+    ) -> AsyncNDJSONRecordReader[typing.Any]:
+        """Asynchronous variant of :meth:`parse_ndjson`."""
+        request, schema = self._prepare_for_ndjson_parse(argmap, req, unknown)
+        stream = self._raw_load_ndjson(request)
+        if inspect.isawaitable(stream):
+            stream = await stream
+        if stream is None:
+            stream = io.BytesIO()
+        return AsyncNDJSONRecordReader(
+            parser=self,
+            req=request,
+            schema=schema,
+            stream=stream,
+            fail_fast=fail_fast,
+            unknown=unknown,
+            chunk_size=chunk_size,
+            max_line_size=max_line_size,
+            encoding=encoding,
+            error_status_code=error_status_code,
+            error_headers=error_headers,
+        )
+
+    def iter_ndjson(
+        self,
+        argmap: ArgMap[Request],
+        req: Request | None = None,
+        **kwargs: typing.Any,
+    ) -> NDJSONRecordReader[typing.Any]:
+        return self.parse_ndjson(argmap, req, **kwargs)
+
+    async def async_iter_ndjson(
+        self,
+        argmap: ArgMap[Request],
+        req: Request | None = None,
+        **kwargs: typing.Any,
+    ) -> AsyncNDJSONRecordReader[typing.Any]:
+        return await self.async_parse_ndjson(argmap, req, **kwargs)
 
     def parse(
         self,
@@ -820,6 +1479,16 @@ class Parser(typing.Generic[Request]):
         if data is not missing:
             return data
         return self.load_form(req, schema)
+
+    def _raw_load_ndjson(self, req: Request) -> typing.Any:
+        """Return a binary request stream suitable for NDJSON line iteration."""
+        return io.BytesIO()
+
+    @staticmethod
+    def _close_ndjson_stream(stream: typing.Any) -> None:
+        close = getattr(stream, "close", None)
+        if close is not None:
+            close()
 
     # Abstract Methods
 
