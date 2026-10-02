@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections.abc
+import copy
 import functools
 import inspect
 import json
@@ -206,6 +207,314 @@ class Parser(typing.Generic[Request]):
         """Create a multidict proxy object with options from the current parser"""
         return cls(multidict, schema, known_multi_fields=tuple(self.KNOWN_MULTI_FIELDS))
 
+    @staticmethod
+    def _field_load_key(field: ma.fields.Field, name: str) -> str:
+        return field.data_key if field.data_key is not None else name
+
+    @staticmethod
+    def _field_request_key(field: ma.fields.Field, name: str) -> str:
+        return field.metadata.get("_webargs_request_data_key") or (
+            field.data_key if field.data_key is not None else name
+        )
+
+    @staticmethod
+    def _field_location(field: ma.fields.Field, default_location: str) -> str:
+        return field.metadata.get("location", default_location)
+
+    def _schema_for_location(
+        self, schema: ma.Schema, location_fields: dict[str, ma.fields.Field]
+    ) -> ma.Schema:
+        location_schema = copy.copy(schema)
+        schema_fields = schema.dict_class()
+        for name, field in location_fields.items():
+            location_field = copy.copy(field)
+            location_field.data_key = self._field_request_key(field, name)
+            location_field.load_only = True
+            location_field.dump_only = False
+            schema_fields[name] = location_field
+        location_schema.fields = schema_fields
+        location_schema.load_fields = schema_fields
+        location_schema.dump_fields = schema.dict_class()
+        return location_schema
+
+    def _has_field_locations(
+        self, schema: ma.Schema, default_location: str
+    ) -> bool:
+        return any(
+            self._field_location(field, default_location) != default_location
+            for field in schema.load_fields.values()
+        )
+
+    def _prepare_field_locations(
+        self, schema: ma.Schema, default_location: str
+    ) -> ma.Schema:
+        if not self._has_field_locations(schema, default_location):
+            return schema
+
+        prepared_schema = copy.copy(schema)
+        prepared_fields = schema.dict_class()
+        prepared_load_fields = schema.dict_class()
+
+        for name, field in schema.fields.items():
+            location = self._field_location(field, default_location)
+            if field in schema.load_fields.values() and location != default_location:
+                prepared_field = copy.copy(field)
+                prepared_field.load_only = True
+                prepared_field.dump_only = False
+                request_key = prepared_field.data_key or name
+                prepared_field.metadata = {
+                    **prepared_field.metadata,
+                    "_webargs_request_data_key": request_key,
+                }
+                prepared_field.attribute = name
+                prepared_field.data_key = f"__webargs_{location}__{request_key}"
+            else:
+                prepared_field = field
+            prepared_fields[name] = prepared_field
+            if not prepared_field.dump_only:
+                prepared_load_fields[name] = prepared_field
+
+        prepared_schema.fields = prepared_fields
+        prepared_schema.load_fields = prepared_load_fields
+        prepared_schema.dump_fields = schema.dict_class()
+        return prepared_schema
+
+    def _get_loader_groups(
+        self, schema: ma.Schema, req: Request, default_location: str
+    ) -> dict[typing.Callable, tuple[str, dict[str, ma.fields.Field]]]:
+        groups: dict[typing.Callable, tuple[str, dict[str, ma.fields.Field]]] = {}
+        for name, field in schema.load_fields.items():
+            location = self._field_location(field, default_location)
+            loader = self._get_loader(location)
+            group = groups.setdefault(loader, (location, {}))
+            group[1][name] = field
+        return groups
+
+    def _validate_field_locations(
+        self, schema: ma.Schema, default_location: str
+    ) -> None:
+        for field in schema.load_fields.values():
+            self._get_loader(self._field_location(field, default_location))
+
+    def _resolve_unknown(self, location: str, unknown: str | None) -> str | None:
+        if unknown != _UNKNOWN_DEFAULT_PARAM:
+            return unknown
+        if self.unknown != _UNKNOWN_DEFAULT_PARAM:
+            return self.unknown
+        return self.DEFAULT_UNKNOWN_BY_LOCATION.get(location)
+
+    def _filter_location_data(
+        self,
+        location_data: typing.Any,
+        *,
+        location: str | None,
+        location_fields: dict[str, ma.fields.Field],
+        unknown: str | None,
+    ) -> tuple[dict[str, typing.Any], dict[str, str]]:
+        if not isinstance(location_data, collections.abc.Mapping):
+            return {}, {}
+
+        known_keys = {
+            self._field_request_key(field, name)
+            for name, field in location_fields.items()
+        }
+        field_keys = {
+            self._field_request_key(field, name): self._field_load_key(field, name)
+            for name, field in location_fields.items()
+        }
+        filtered_data: dict[str, typing.Any] = {}
+        key_locations: dict[str, str] = {}
+
+        for key in location_data:
+            if key in known_keys:
+                merge_key = field_keys[key]
+                filtered_data[merge_key] = location_data[key]
+                key_locations[merge_key] = location
+            elif unknown == ma.EXCLUDE:
+                continue
+            elif unknown == ma.INCLUDE:
+                filtered_data[key] = location_data[key]
+                key_locations[key] = location
+            else:
+                raise ValidationError(
+                    {location: {key: ["Unknown field."]}},
+                    data=dict(location_data),
+                )
+
+        return filtered_data, key_locations
+
+    def _merge_location_data(
+        self,
+        location_data_items: list[tuple[str, dict[str, typing.Any], dict[str, str]]],
+        field_key_locations: dict[str, str],
+    ) -> tuple[dict[str, typing.Any], dict[str, str]]:
+        merged_data: dict[str, typing.Any] = {}
+        key_locations = dict(field_key_locations)
+
+        for location, location_data, _locations in location_data_items:
+            for key, value in location_data.items():
+                if key in merged_data and key_locations[key] != location:
+                    raise ValidationError(
+                        {
+                            "_schema": [
+                                (
+                                    f"Ambiguous value for {key!r} from "
+                                    f"{key_locations[key]!r} and {location!r}."
+                                )
+                            ]
+                        },
+                        data=merged_data,
+                    )
+                merged_data[key] = value
+                key_locations[key] = location
+
+        return merged_data, key_locations
+
+    def _remap_multilocation_messages(
+        self,
+        messages: typing.Any,
+        key_locations: dict[str, str],
+        schema: ma.Schema,
+    ) -> dict[str, typing.Any]:
+        remapped: dict[str, typing.Any] = {}
+        request_keys = {
+            self._field_load_key(field, name): self._field_request_key(field, name)
+            for name, field in schema.load_fields.items()
+        }
+        for key, value in messages.items():
+            location = key_locations.get(key)
+            if location is None:
+                remapped[key] = value
+            else:
+                request_key = request_keys.get(key, key)
+                remapped.setdefault(location, {})[request_key] = value
+        return remapped
+
+    def _process_multiple_location_data(
+        self,
+        *,
+        schema: ma.Schema,
+        req: Request,
+        default_location: str,
+        unknown: str | None,
+        validators: CallableList,
+        location_data: dict[typing.Callable, typing.Any] | None = None,
+    ) -> typing.Any:
+        self._validate_field_locations(schema, default_location)
+        loader_groups = self._get_loader_groups(schema, req, default_location)
+        loaded_data = location_data or {}
+
+        for loader, (location, location_fields) in loader_groups.items():
+            if loader not in loaded_data:
+                location_schema = self._schema_for_location(schema, location_fields)
+                loaded_data[loader] = self._load_location_data(
+                    schema=location_schema, req=req, location=location
+                )
+
+        return self._process_loaded_multiple_location_data(
+            schema=schema,
+            req=req,
+            unknown=unknown,
+            validators=validators,
+            loader_groups=loader_groups,
+            loaded_data=loaded_data,
+        )
+
+    def _process_loaded_multiple_location_data(
+        self,
+        *,
+        schema: ma.Schema,
+        req: Request,
+        unknown: str | None,
+        validators: CallableList,
+        loader_groups: dict[typing.Callable, tuple[str, dict[str, ma.fields.Field]]],
+        loaded_data: dict[typing.Callable, typing.Any],
+    ) -> typing.Any:
+        field_key_locations: dict[str, str] = {}
+        for group_location, location_fields in loader_groups.values():
+            for name, field in location_fields.items():
+                field_key_locations[self._field_load_key(field, name)] = group_location
+
+        processed_locations: list[
+            tuple[str, dict[str, typing.Any], dict[str, str]]
+        ] = []
+
+        for loader, (location, location_fields) in loader_groups.items():
+            raw_location_data = loaded_data[loader]
+            if raw_location_data is missing:
+                raw_location_data = {}
+
+            preprocessed_data = self.pre_load(
+                raw_location_data,
+                schema=schema,
+                req=req,
+                location=location,
+            )
+            location_unknown = self._resolve_unknown(location, unknown)
+            if location_unknown is None:
+                location_unknown = schema.unknown
+            filtered_data, key_locations = self._filter_location_data(
+                preprocessed_data,
+                location=location,
+                location_fields=location_fields,
+                unknown=location_unknown,
+            )
+            processed_locations.append((location, filtered_data, key_locations))
+
+        data, key_locations = self._merge_location_data(
+            processed_locations, field_key_locations
+        )
+        included_locations = []
+        for group_location, _location_fields in loader_groups.values():
+            location_unknown = self._resolve_unknown(group_location, unknown)
+            if location_unknown is None:
+                location_unknown = schema.unknown
+            if location_unknown == ma.INCLUDE:
+                included_locations.append(group_location)
+        load_unknown = ma.INCLUDE if included_locations else ma.RAISE
+
+        try:
+            data = schema.load(data, unknown=load_unknown)
+            self._validate_arguments(data, validators)
+        except ma.exceptions.ValidationError as error:
+            error.messages = self._remap_multilocation_messages(
+                error.messages, key_locations, schema
+            )
+            raise
+
+        return data
+
+    async def _async_process_multiple_location_data(
+        self,
+        *,
+        schema: ma.Schema,
+        req: Request,
+        default_location: str,
+        unknown: str | None,
+        validators: CallableList,
+        location_data: dict[typing.Callable, typing.Any] | None = None,
+    ) -> typing.Any:
+        self._validate_field_locations(schema, default_location)
+        loader_groups = self._get_loader_groups(schema, req, default_location)
+        loaded_data = location_data or {}
+
+        for loader, (location, location_fields) in loader_groups.items():
+            if loader in loaded_data:
+                continue
+            else:
+                location_schema = self._schema_for_location(schema, location_fields)
+                loaded_data[loader] = await self._async_load_location_data(
+                    location_schema, req, location
+                )
+        return self._process_loaded_multiple_location_data(
+            schema=schema,
+            req=req,
+            unknown=unknown,
+            validators=validators,
+            loader_groups=loader_groups,
+            loaded_data=loaded_data,
+        )
+
     def _get_loader(self, location: str) -> typing.Callable:
         """Get the loader function for the given location.
 
@@ -252,7 +561,7 @@ class Parser(typing.Generic[Request]):
         error: ValidationError,
         req: Request,
         schema: ma.Schema,
-        location: str,
+        location: str | None,
         *,
         error_status_code: int | None,
         error_headers: typing.Mapping[str, str] | None,
@@ -262,7 +571,8 @@ class Parser(typing.Generic[Request]):
         # e.g. {"json":{"foo":["Not a valid integer."]}}
         #      instead of
         #      {"foo":["Not a valid integer."]}
-        error.messages = {location: error.messages}
+        if location is not None:
+            error.messages = {location: error.messages}
         error_handler: ErrorHandler = self.error_callback or self.handle_error
         error_handler(
             error,
@@ -277,13 +587,14 @@ class Parser(typing.Generic[Request]):
         error: ValidationError,
         req: Request,
         schema: ma.Schema,
-        location: str,
+        location: str | None,
         *,
         error_status_code: int | None,
         error_headers: typing.Mapping[str, str] | None,
     ) -> typing.NoReturn:
         # an async-aware variant of the _on_validation_error method
-        error.messages = {location: error.messages}
+        if location is not None:
+            error.messages = {location: error.messages}
         error_handler = self.error_callback or self.handle_error
         # an async error handler was registered, await it
         if inspect.iscoroutinefunction(error_handler):
@@ -314,7 +625,9 @@ class Parser(typing.Generic[Request]):
                 msg = self.DEFAULT_VALIDATION_MESSAGE
                 raise ValidationError(msg, data=data)
 
-    def _get_schema(self, argmap: ArgMap[Request], req: Request) -> ma.Schema:
+    def _get_schema(
+        self, argmap: ArgMap[Request], req: Request
+    ) -> ma.Schema:
         """Return a `marshmallow.Schema` for the given argmap and request.
 
         :param argmap: Either a `marshmallow.Schema`, `dict`
@@ -353,6 +666,7 @@ class Parser(typing.Generic[Request]):
         location = location or self.location
         validators = _ensure_list_of_callables(validate)
         schema = self._get_schema(argmap, req)
+        schema = self._prepare_field_locations(schema, location)
         return (None, req, location, validators, schema)
 
     def _process_location_data(
@@ -430,19 +744,29 @@ class Parser(typing.Generic[Request]):
         data, req, location, validators, schema = self._prepare_for_parse(
             argmap, req, location, unknown, validate
         )
+        has_field_locations = self._has_field_locations(schema, location)
         try:
-            location_data = self._load_location_data(
-                schema=schema, req=req, location=location
-            )
-            data = self._process_location_data(
-                location_data, schema, req, location, unknown, validators
-            )
+            if has_field_locations:
+                data = self._process_multiple_location_data(
+                    schema=schema,
+                    req=req,
+                    default_location=location,
+                    unknown=unknown,
+                    validators=validators,
+                )
+            else:
+                location_data = self._load_location_data(
+                    schema=schema, req=req, location=location
+                )
+                data = self._process_location_data(
+                    location_data, schema, req, location, unknown, validators
+                )
         except ma.exceptions.ValidationError as error:
             self._on_validation_error(
                 error,
                 req,
                 schema,
-                location,
+                None if has_field_locations else location,
                 error_status_code=error_status_code,
                 error_headers=error_headers,
             )
@@ -469,19 +793,29 @@ class Parser(typing.Generic[Request]):
         data, req, location, validators, schema = self._prepare_for_parse(
             argmap, req, location, unknown, validate
         )
+        has_field_locations = self._has_field_locations(schema, location)
         try:
-            location_data = await self._async_load_location_data(
-                schema=schema, req=req, location=location
-            )
-            data = self._process_location_data(
-                location_data, schema, req, location, unknown, validators
-            )
+            if has_field_locations:
+                data = await self._async_process_multiple_location_data(
+                    schema=schema,
+                    req=req,
+                    default_location=location,
+                    unknown=unknown,
+                    validators=validators,
+                )
+            else:
+                location_data = await self._async_load_location_data(
+                    schema=schema, req=req, location=location
+                )
+                data = self._process_location_data(
+                    location_data, schema, req, location, unknown, validators
+                )
         except ma.exceptions.ValidationError as error:
             await self._async_on_validation_error(
                 error,
                 req,
                 schema,
-                location,
+                None if has_field_locations else location,
                 error_status_code=error_status_code,
                 error_headers=error_headers,
             )

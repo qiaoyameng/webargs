@@ -19,8 +19,29 @@ import typing
 
 import marshmallow as ma
 
-# Expose all fields from marshmallow.fields.
-from marshmallow.fields import *  # noqa: F403
+
+class LocationFieldMixin:
+    """Store webargs' field-specific request location in field metadata."""
+
+    def __init__(
+        self, *args: typing.Any, location: str | None = None, **kwargs: typing.Any
+    ):
+        metadata = dict(kwargs.pop("metadata", None) or {})
+        if location is not None:
+            metadata["location"] = location
+            kwargs["load_only"] = True
+        super().__init__(*args, metadata=metadata, **kwargs)
+
+
+def _make_location_field(name: str) -> type:
+    base = getattr(ma.fields, name)
+    return type(name, (LocationFieldMixin, base), {})
+
+
+# Expose all fields from marshmallow.fields, with support for webargs'
+# field-specific ``location`` keyword.
+_location_fields = {name: _make_location_field(name) for name in ma.fields.__all__}
+globals().update(_location_fields)
 
 __all__ = ["DelimitedList", "DelimitedTuple"] + ma.fields.__all__
 
@@ -61,7 +82,7 @@ class DelimitedFieldMixin:
         return super()._deserialize(values, attr, data, **kwargs)
 
 
-class DelimitedList(DelimitedFieldMixin, ma.fields.List):
+class DelimitedList(DelimitedFieldMixin, List):
     """A field which is similar to a List, but takes its input as a delimited
     string (e.g. "foo,bar,baz").
 
@@ -85,7 +106,7 @@ class DelimitedList(DelimitedFieldMixin, ma.fields.List):
         super().__init__(cls_or_instance, **kwargs)
 
 
-class DelimitedTuple(DelimitedFieldMixin, ma.fields.Tuple):
+class DelimitedTuple(DelimitedFieldMixin, Tuple):
     """A field which is similar to a Tuple, but takes its input as a delimited
     string (e.g. "foo,bar,baz").
 

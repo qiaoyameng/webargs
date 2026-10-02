@@ -1,7 +1,8 @@
 from unittest import mock
 
+import marshmallow as ma
 import pytest
-from flask import Flask
+from flask import Flask, jsonify
 from marshmallow import Schema
 from werkzeug.exceptions import BadRequest, HTTPException
 
@@ -11,6 +12,47 @@ from webargs.flaskparser import abort, parser
 from webargs.testing import CommonTestCase
 
 from .apps.flask_app import app
+
+
+def create_multilocation_app():
+    from webargs.flaskparser import parser
+
+    multilocation_app = Flask(__name__)
+
+    class ReleaseSchema(ma.Schema):
+        query_version = fields.Int(
+            required=True, location="query", data_key="version"
+        )
+        header_version = fields.Int(
+            required=True, location="headers", data_key="X-Version"
+        )
+        body_version = fields.Int(required=True, location="json", data_key="version")
+
+        @ma.validates_schema
+        def validate_release(self, data, **kwargs):
+            versions = [
+                data["query_version"],
+                data["header_version"],
+                data["body_version"],
+            ]
+            if len(set(versions)) != 1:
+                raise ma.ValidationError("All versions must match.")
+
+    @multilocation_app.post("/release")
+    def release():
+        args = parser.parse(ReleaseSchema())
+        return jsonify(args)
+
+    @multilocation_app.post("/release-async")
+    async def release_async():
+        args = await parser.async_parse(ReleaseSchema())
+        return jsonify(args)
+
+    @multilocation_app.errorhandler(422)
+    def handle_validation_error(error: HTTPException):
+        return jsonify(error.data["messages"]), error.code
+
+    return multilocation_app
 
 
 class TestFlaskParser(CommonTestCase):
@@ -151,6 +193,89 @@ def test_abort_called_on_validation_error(mock_abort):
     expected_msg = "Invalid value."
     assert abort_kwargs["messages"]["json"]["value"] == [expected_msg]
     assert type(abort_kwargs["exc"]) is ValidationError
+
+
+@pytest.mark.parametrize("path", ["/release", "/release-async"])
+@pytest.mark.parametrize(
+    ("query", "headers", "json_body", "expected"),
+    [
+        (
+            "",
+            {"X-Version": "1"},
+            {"version": 1},
+            {"query": {"version": ["Missing data for required field."]}},
+        ),
+        (
+            "?version=1",
+            {},
+            {"version": 1},
+            {"headers": {"X-Version": ["Missing data for required field."]}},
+        ),
+        (
+            "?version=1",
+            {"X-Version": "1"},
+            {},
+            {"json": {"version": ["Missing data for required field."]}},
+        ),
+    ],
+)
+def test_multilocation_missing_inputs_are_distinguishable(
+    path, query, headers, json_body, expected
+):
+    client = create_multilocation_app().test_client()
+
+    response = client.post(
+        f"{path}{query}",
+        json=json_body,
+        headers=headers,
+    )
+
+    assert response.status_code == 422
+    assert response.get_json() == expected
+
+
+@pytest.mark.parametrize("path", ["/release", "/release-async"])
+def test_multilocation_schema_validation_runs_after_combining_sources(path):
+    client = create_multilocation_app().test_client()
+
+    response = client.post(
+        f"{path}?version=1",
+        json={"version": 1},
+        headers={"X-Version": "2"},
+    )
+
+    assert response.status_code == 422
+    assert response.get_json() == {"_schema": ["All versions must match."]}
+
+    response = client.post(
+        f"{path}?version=1",
+        json={"version": 1},
+        headers={"X-Version": "1"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "query_version": 1,
+        "header_version": 1,
+        "body_version": 1,
+    }
+
+
+def test_multilocation_request_body_is_read_once():
+    client = create_multilocation_app().test_client()
+
+    with mock.patch(
+        "webargs.flaskparser.FlaskParser._raw_load_json",
+        wraps=parser._raw_load_json,
+    ) as load_json:
+        response = client.post(
+            "/release?version=1",
+            json={"version": 1},
+            headers={"X-Version": "1"},
+        )
+
+    assert response.status_code == 200
+    assert load_json.call_count == 1
 
 
 @pytest.mark.asyncio
