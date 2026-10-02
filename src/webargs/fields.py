@@ -2,14 +2,18 @@
 
 Includes all fields from `marshmallow.fields` in addition to `DelimitedList`.
 
-All fields can optionally take a special `location` keyword argument, which
-tells webargs where to parse the request argument from.
+All fields can optionally declare a special `location` in their metadata,
+which tells webargs where to parse the request argument from. When at least
+one field declares a location, data from all of the declared locations is
+combined and validated in a single parse.
 
 .. code-block:: python
 
     args = {
-        "active": fields.Bool(location="query"),
-        "content_type": fields.Str(data_key="Content-Type", location="headers"),
+        "active": fields.Bool(metadata={"location": "query"}),
+        "content_type": fields.Str(
+            data_key="Content-Type", metadata={"location": "headers"}
+        ),
     }
 """
 

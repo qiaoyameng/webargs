@@ -43,6 +43,9 @@ class MockRequestParser(Parser):
     def load_cookies(self, req, schema):
         return req.cookies
 
+    def load_headers(self, req, schema):
+        return self._makeproxy(req.headers, schema)
+
 
 @pytest.fixture(scope="function")
 def web_request():
@@ -1707,3 +1710,152 @@ def test_default_arg_name_pattern_can_pull_schema_attribute(web_request):
 
     web_request.json = {"length": 6, "width": 7}
     assert area() == 42
+
+
+@pytest.mark.parametrize("method", ["parse", "async_parse"])
+@pytest.mark.asyncio
+async def test_parse_with_field_level_locations(parser, web_request, method):
+    web_request.json = {"name": "foo"}
+    web_request.query = {"page": "2"}
+    web_request.headers = {"X-Version": "3"}
+    argmap = {
+        "name": fields.Str(required=True),
+        "page": fields.Int(required=True, metadata={"location": "query"}),
+        "version": fields.Int(
+            required=True, data_key="X-Version", metadata={"location": "headers"}
+        ),
+    }
+    if method == "async_parse":
+        ret = await parser.async_parse(argmap, web_request)
+    else:
+        ret = parser.parse(argmap, web_request)
+    assert ret == {"name": "foo", "page": 2, "version": 3}
+
+
+def test_parse_with_field_locations_loads_each_location_once(parser, web_request):
+    web_request.json = {"a": 1, "b": 2}
+    web_request.query = {"c": 3}
+    argmap = {
+        "a": fields.Int(),
+        "b": fields.Int(),
+        "c": fields.Int(metadata={"location": "query"}),
+    }
+    with (
+        mock.patch.object(
+            MockRequestParser, "load_json", wraps=parser.load_json
+        ) as load_json,
+        mock.patch.object(
+            MockRequestParser, "load_querystring", wraps=parser.load_querystring
+        ) as load_query,
+    ):
+        ret = parser.parse(argmap, web_request)
+    assert ret == {"a": 1, "b": 2, "c": 3}
+    assert load_json.call_count == 1
+    assert load_query.call_count == 1
+
+
+def test_parse_with_field_locations_error_messages_are_namespaced(parser, web_request):
+    web_request.json = {"name": "foo"}
+    web_request.query = {"page": "not-an-int"}
+    web_request.headers = {"X-Version": "also-not-an-int"}
+    argmap = {
+        "name": fields.Str(required=True),
+        "page": fields.Int(required=True, metadata={"location": "query"}),
+        "version": fields.Int(
+            required=True, data_key="X-Version", metadata={"location": "headers"}
+        ),
+    }
+    with pytest.raises(ValidationError) as excinfo:
+        parser.parse(argmap, web_request)
+    assert excinfo.value.messages == {
+        "query": {"page": ["Not a valid integer."]},
+        "headers": {"X-Version": ["Not a valid integer."]},
+    }
+
+
+def test_parse_with_field_locations_schema_error_is_not_namespaced(parser, web_request):
+    class MySchema(Schema):
+        name = fields.Str(required=True)
+        page = fields.Int(required=True, metadata={"location": "query"})
+
+        @validates_schema
+        def validate_schema(self, data, **kwargs):
+            raise ValidationError("name and page are incompatible")
+
+    web_request.json = {"name": "foo"}
+    web_request.query = {"page": "2"}
+    with pytest.raises(ValidationError) as excinfo:
+        parser.parse(MySchema(), web_request)
+    assert excinfo.value.messages == {"_schema": ["name and page are incompatible"]}
+
+
+def test_parse_with_field_locations_schema_level_validate_arg(parser, web_request):
+    web_request.json = {"name": "foo"}
+    web_request.query = {"page": "2"}
+    argmap = {
+        "name": fields.Str(),
+        "page": fields.Int(metadata={"location": "query"}),
+    }
+    with pytest.raises(ValidationError) as excinfo:
+        parser.parse(argmap, web_request, validate=lambda data: False)
+    assert excinfo.value.messages == {"_schema": ["Invalid value."]}
+
+
+def test_parse_with_field_locations_same_key_conflict(parser, web_request):
+    web_request.json = {"page": "1"}
+    web_request.query = {"page": "2"}
+    argmap = {
+        "name": fields.Str(),
+        "page": fields.Int(metadata={"location": "query"}),
+    }
+    with pytest.raises(ValidationError) as excinfo:
+        parser.parse(argmap, web_request)
+    messages = excinfo.value.messages
+    assert list(messages.keys()) == ["query"]
+    assert "Conflicting values for argument 'page'" in messages["query"]["page"][0]
+    assert "'json'" in messages["query"]["page"][0]
+    assert "'query'" in messages["query"]["page"][0]
+
+
+def test_parse_with_field_locations_unknown_policy_preserved(parser, web_request):
+    # unknown keys in the default location (json) still raise by default
+    web_request.json = {"name": "foo", "junk": 1}
+    web_request.query = {"page": "2", "other_junk": "3"}
+    argmap = {
+        "name": fields.Str(),
+        "page": fields.Int(metadata={"location": "query"}),
+    }
+    with pytest.raises(ValidationError) as excinfo:
+        parser.parse(argmap, web_request)
+    # unknown keys are attributed to the default location
+    assert excinfo.value.messages == {"json": {"junk": ["Unknown field."]}}
+
+    # ... and can be excluded explicitly, while query junk is always excluded
+    ret = parser.parse(argmap, web_request, unknown=EXCLUDE)
+    assert ret == {"name": "foo", "page": 2}
+
+
+def test_parse_with_field_locations_multiple_values(parser, web_request):
+    web_request.json = {}
+    web_request.query = WerkMultiDict([("tag", "a"), ("tag", "b")])
+    argmap = {
+        "tags": fields.List(
+            fields.Str(), data_key="tag", metadata={"location": "query"}
+        ),
+    }
+    ret = parser.parse(argmap, web_request)
+    assert ret == {"tags": ["a", "b"]}
+
+
+@pytest.mark.asyncio
+async def test_async_parse_with_field_locations_error_messages_are_namespaced(
+    parser, web_request
+):
+    web_request.json = {}
+    web_request.query = {"page": "not-an-int"}
+    argmap = {
+        "page": fields.Int(required=True, metadata={"location": "query"}),
+    }
+    with pytest.raises(ValidationError) as excinfo:
+        await parser.async_parse(argmap, web_request)
+    assert excinfo.value.messages == {"query": {"page": ["Not a valid integer."]}}

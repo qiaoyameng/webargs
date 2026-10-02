@@ -252,7 +252,7 @@ class Parser(typing.Generic[Request]):
         error: ValidationError,
         req: Request,
         schema: ma.Schema,
-        location: str,
+        location: str | None,
         *,
         error_status_code: int | None,
         error_headers: typing.Mapping[str, str] | None,
@@ -262,7 +262,10 @@ class Parser(typing.Generic[Request]):
         # e.g. {"json":{"foo":["Not a valid integer."]}}
         #      instead of
         #      {"foo":["Not a valid integer."]}
-        error.messages = {location: error.messages}
+        # a location of None indicates that the messages are already
+        # namespaced (multi-location parse)
+        if location is not None:
+            error.messages = {location: error.messages}
         error_handler: ErrorHandler = self.error_callback or self.handle_error
         error_handler(
             error,
@@ -277,13 +280,14 @@ class Parser(typing.Generic[Request]):
         error: ValidationError,
         req: Request,
         schema: ma.Schema,
-        location: str,
+        location: str | None,
         *,
         error_status_code: int | None,
         error_headers: typing.Mapping[str, str] | None,
     ) -> typing.NoReturn:
         # an async-aware variant of the _on_validation_error method
-        error.messages = {location: error.messages}
+        if location is not None:
+            error.messages = {location: error.messages}
         error_handler = self.error_callback or self.handle_error
         # an async error handler was registered, await it
         if inspect.iscoroutinefunction(error_handler):
@@ -392,6 +396,111 @@ class Parser(typing.Generic[Request]):
         self._validate_arguments(data, validators)
         return data
 
+    def _multilocation_field_map(
+        self, schema: ma.Schema, location: str
+    ) -> dict[str, list[tuple[str, ma.fields.Field]]] | None:
+        """Group schema fields by their effective location.
+
+        A field may declare its location with ``metadata={"location": ...}``.
+        Fields without a declared location use the default ``location``.
+
+        Returns `None` if no field declares a location, signaling that the
+        single-location code path should be used.
+        """
+        schema_fields = getattr(schema, "fields", None)
+        if not isinstance(schema_fields, dict):
+            return None
+        field_map: dict[str, list[tuple[str, ma.fields.Field]]] = {}
+        has_declared_location = False
+        for name, field in schema_fields.items():
+            declared_location = field.metadata.get("location")
+            if declared_location is not None:
+                has_declared_location = True
+            effective_location = declared_location or location
+            field_map.setdefault(effective_location, []).append((name, field))
+        if not has_declared_location:
+            return None
+        return field_map
+
+    def _combine_multilocation_data(
+        self,
+        location_data_map: dict[str, typing.Any],
+        field_map: dict[str, list[tuple[str, ma.fields.Field]]],
+        location: str,
+    ) -> dict[str, typing.Any]:
+        """Merge data loaded from multiple locations into a single mapping.
+
+        All of the data from the default location is included, so that the
+        ``unknown`` handling for that location is preserved. From every other
+        location, only the keys of the fields declared for that location are
+        taken. A key found in more than one location is an error rather than
+        a silent overwrite.
+        """
+        combined: dict[str, typing.Any] = {}
+        key_sources: dict[str, str] = {}
+        # the default location may be absent if no field uses it
+        default_data = location_data_map.get(location, missing)
+        if default_data is not missing:
+            for key in default_data:
+                combined[key] = default_data[key]
+                key_sources[key] = location
+        for loc, fields_at_location in field_map.items():
+            if loc == location:
+                continue
+            location_data = location_data_map[loc]
+            if location_data is missing:
+                continue
+            for name, field in fields_at_location:
+                key = field.data_key if field.data_key is not None else name
+                if key not in location_data:
+                    continue
+                if key in combined:
+                    other_location = key_sources[key]
+                    raise ValidationError(
+                        {
+                            key: [
+                                f"Conflicting values for argument '{key}' "
+                                f"from locations '{other_location}' and '{loc}'."
+                            ]
+                        }
+                    )
+                combined[key] = location_data[key]
+                key_sources[key] = loc
+        return combined
+
+    def _multilocation_error_messages(
+        self,
+        error: ValidationError,
+        field_map: dict[str, list[tuple[str, ma.fields.Field]]],
+        location: str,
+    ) -> dict[str, typing.Any]:
+        """Namespace field error messages under the location which provided
+        the field.
+
+        Schema-level errors are kept at the top level under ``"_schema"`` so
+        that they are not attributed to any single location.
+        """
+        messages = error.messages
+        if not isinstance(messages, dict):
+            return {"_schema": messages if isinstance(messages, list) else [messages]}
+        key_to_location: dict[str, str] = {}
+        for loc, fields_at_location in field_map.items():
+            for name, field in fields_at_location:
+                key_to_location[name] = loc
+                if field.data_key is not None:
+                    key_to_location[field.data_key] = loc
+        remapped: dict[str, typing.Any] = {}
+        for key, field_messages in messages.items():
+            if key == "_schema":
+                remapped.setdefault("_schema", []).extend(field_messages)
+            elif key in key_to_location:
+                remapped.setdefault(key_to_location[key], {})[key] = field_messages
+            else:
+                # e.g. unknown fields, which can only come from the data of
+                # the default location
+                remapped.setdefault(location, {})[key] = field_messages
+        return remapped
+
     def parse(
         self,
         argmap: ArgMap[Request],
@@ -413,6 +522,11 @@ class Parser(typing.Generic[Request]):
             Can be any of the values in :py:attr:`~__location_map__`. By
             default, that means one of ``('json', 'query', 'querystring',
             'form', 'headers', 'cookies', 'files', 'json_or_form')``.
+            Individual fields may override this by declaring a location in
+            their metadata, e.g. ``fields.Str(metadata={"location":
+            "headers"})``. If any field declares a location, data from all
+            of the declared locations is combined and validated in a single
+            pass, so schema-level validators see the complete data.
         :param str unknown: A value to pass for ``unknown`` when calling the
             schema's ``load`` method. Defaults to ``marshmallow.EXCLUDE`` for non-body
             locations and ``marshmallow.RAISE`` for request bodies. Pass ``None`` to use
@@ -430,19 +544,35 @@ class Parser(typing.Generic[Request]):
         data, req, location, validators, schema = self._prepare_for_parse(
             argmap, req, location, unknown, validate
         )
+        field_map = self._multilocation_field_map(schema, location)
         try:
-            location_data = self._load_location_data(
-                schema=schema, req=req, location=location
-            )
+            if field_map is None:
+                location_data = self._load_location_data(
+                    schema=schema, req=req, location=location
+                )
+            else:
+                # load each needed location at most once, so that e.g. the
+                # request body is not read multiple times
+                location_data_map = {
+                    loc: self._load_location_data(schema=schema, req=req, location=loc)
+                    for loc in field_map
+                }
+                location_data = self._combine_multilocation_data(
+                    location_data_map, field_map, location
+                )
             data = self._process_location_data(
                 location_data, schema, req, location, unknown, validators
             )
         except ma.exceptions.ValidationError as error:
+            if field_map is not None:
+                error.messages = self._multilocation_error_messages(
+                    error, field_map, location
+                )
             self._on_validation_error(
                 error,
                 req,
                 schema,
-                location,
+                location if field_map is None else None,
                 error_status_code=error_status_code,
                 error_headers=error_headers,
             )
@@ -469,19 +599,36 @@ class Parser(typing.Generic[Request]):
         data, req, location, validators, schema = self._prepare_for_parse(
             argmap, req, location, unknown, validate
         )
+        field_map = self._multilocation_field_map(schema, location)
         try:
-            location_data = await self._async_load_location_data(
-                schema=schema, req=req, location=location
-            )
+            if field_map is None:
+                location_data = await self._async_load_location_data(
+                    schema=schema, req=req, location=location
+                )
+            else:
+                # load each needed location at most once, so that e.g. the
+                # request body is not read multiple times
+                location_data_map = {}
+                for loc in field_map:
+                    location_data_map[loc] = await self._async_load_location_data(
+                        schema=schema, req=req, location=loc
+                    )
+                location_data = self._combine_multilocation_data(
+                    location_data_map, field_map, location
+                )
             data = self._process_location_data(
                 location_data, schema, req, location, unknown, validators
             )
         except ma.exceptions.ValidationError as error:
+            if field_map is not None:
+                error.messages = self._multilocation_error_messages(
+                    error, field_map, location
+                )
             await self._async_on_validation_error(
                 error,
                 req,
                 schema,
-                location,
+                location if field_map is None else None,
                 error_status_code=error_status_code,
                 error_headers=error_headers,
             )

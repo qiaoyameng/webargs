@@ -1,8 +1,8 @@
 from unittest import mock
 
 import pytest
-from flask import Flask
-from marshmallow import Schema
+from flask import Flask, jsonify
+from marshmallow import Schema, validates_schema
 from werkzeug.exceptions import BadRequest, HTTPException
 
 from webargs import ValidationError, fields, missing
@@ -204,6 +204,93 @@ def test_abort_has_serializable_data():
     error = json.loads(serialized_error)
     assert isinstance(error, dict)
     assert error["message"] == "custom error message"
+
+
+class TestMultiLocationParsing:
+    """Parsing a schema whose fields declare different locations, so that
+    query, header, and body data are combined and validated in one pass.
+    """
+
+    @pytest.fixture()
+    def client(self):
+        app = Flask(__name__)
+
+        class DeploySchema(Schema):
+            service = fields.Str(required=True)
+            env = fields.Str(required=True, metadata={"location": "query"})
+            version = fields.Str(
+                required=True,
+                data_key="X-Version",
+                metadata={"location": "headers"},
+            )
+
+            @validates_schema
+            def check_version_for_env(self, data, **kwargs):
+                version = data.get("version")
+                if (
+                    data.get("env") == "prod"
+                    and version is not None
+                    and not version.startswith("2.")
+                ):
+                    raise ValidationError("prod deploys require version 2.x")
+
+        @app.route("/deploy", methods=["POST"])
+        @parser.use_args(DeploySchema(), location="json")
+        def deploy(args):
+            return jsonify(args)
+
+        @app.errorhandler(422)
+        def handle_422(err):
+            return jsonify(err.data["messages"]), 422
+
+        return app.test_client()
+
+    def test_valid_request_combines_all_locations(self, client):
+        res = client.post(
+            "/deploy?env=staging",
+            json={"service": "web"},
+            headers={"X-Version": "1.0"},
+        )
+        assert res.status_code == 200
+        assert res.get_json() == {
+            "service": "web",
+            "env": "staging",
+            "version": "1.0",
+        }
+
+    def test_missing_body_param_errors_under_json(self, client):
+        res = client.post(
+            "/deploy?env=staging", json={}, headers={"X-Version": "1.0"}
+        )
+        assert res.status_code == 422
+        assert res.get_json() == {
+            "json": {"service": ["Missing data for required field."]}
+        }
+
+    def test_missing_query_param_errors_under_query(self, client):
+        res = client.post(
+            "/deploy", json={"service": "web"}, headers={"X-Version": "1.0"}
+        )
+        assert res.status_code == 422
+        assert res.get_json() == {
+            "query": {"env": ["Missing data for required field."]}
+        }
+
+    def test_missing_header_param_errors_under_headers(self, client):
+        res = client.post("/deploy?env=staging", json={"service": "web"})
+        assert res.status_code == 422
+        assert res.get_json() == {
+            "headers": {"X-Version": ["Missing data for required field."]}
+        }
+
+    def test_schema_level_error_is_not_attributed_to_a_location(self, client):
+        res = client.post(
+            "/deploy?env=prod",
+            json={"service": "web"},
+            headers={"X-Version": "1.0"},
+        )
+        assert res.status_code == 422
+        assert res.get_json() == {"_schema": ["prod deploys require version 2.x"]}
 
     with pytest.raises(HTTPException) as excinfo:
         abort(

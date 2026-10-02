@@ -121,6 +121,28 @@ Available locations include:
 - ``'cookies'``
 - ``'files'``
 
+Individual fields can also declare their own location in their metadata. When
+at least one field declares a location, webargs combines the data from all of
+the declared locations and validates it in a single pass, so schema-level
+validators see the complete data:
+
+.. code-block:: python
+
+    args = {
+        # parsed from the JSON body (the default location)
+        "name": fields.Str(required=True),
+        # parsed from the query string
+        "page": fields.Int(metadata={"location": "query"}),
+        # parsed from the request headers
+        "version": fields.Str(
+            data_key="X-Version", metadata={"location": "headers"}
+        ),
+    }
+
+Fields without a declared location use the default location. If the same
+argument is found in more than one location, an error is raised rather than
+silently overwriting one of the values.
+
 Validation
 ----------
 

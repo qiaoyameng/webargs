@@ -6,6 +6,14 @@ Changelog
 
 Features:
 
+* Fields may declare their request location via metadata, e.g.
+  ``fields.Str(metadata={"location": "headers"})``. When at least one field
+  declares a location, data from all declared locations is combined in a
+  single parse (for both ``parse`` and ``async_parse``), so schema-level
+  validators see the complete data. Errors are namespaced under the location
+  which provided each field, while schema-level errors are reported under
+  ``"_schema"``. Arguments found in more than one location raise an error
+  rather than being silently overwritten.
 * *Backwards-incompatible*: Remove ``__version__``, ``__parsed_version__``, and
   ``__version_info__`` constants from ``__init__.py`` file. Users should use
   ``importlib.metadata`` instead (:pr:`1024`).
